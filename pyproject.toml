@@ -1,0 +1,96 @@
+[project]
+name = "water-containment-recorder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastparquet>=2026.5.0",
+    "numpy>=2.5.1",
+    "pillow>=12.3.0",
+    "polars>=1.43.0",
+    "pyarrow>=25.0.0",
+    "pyserial>=3.5",
+    "scikit-rf>=2.0.1",
+    "scipy>=1.18.0",
+    "scipy-stubs>=1.18.0.1",
+    "shared-python",
+]
+
+[project.scripts]
+water-content-recorder = "water_content_recorder.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/water_content_recorder"]
+
+[tool.uv.workspace]
+members = ["shared_python"]
+
+[tool.uv.sources]
+shared-python = { workspace = true }
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py312"
+fix = true
+extend-exclude = ["shared_python"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D213",   # multi-line summary second line
+    "ANN204", # annotation is not needed
+    "ANN401", # annotation is not needed
+    "G004",   # use f-string
+    "D100",   # missing docstring on module
+    "D400",   # First line should end with a period
+    "D401",   # First line should be in imperative mood
+    "D415",   # First line must end with punctuation
+]
+unfixable = [
+    "F401",   # unused import
+    "F841",   # unused variable
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",     # asserts are expected in tests
+    "D",        # docstrings not required in tests
+    "ANN",      # type annotations optional in tests
+    "INP001",   # tests is not an importable package
+    "PLR2004",  # magic values are fine in test assertions
+    "TC",       # keep type-only imports inline in tests
+    "SLF001",   # accessing private members is fine in tests
+    "ARG",      # unused args are common in fakes/stubs
+    "FBT",      # boolean positional args are fine in tests
+    "PLR0913",  # many fixture/params are fine in tests
+    "PYI034",   # fake async context managers may return concrete types
+    "PLC0415",  # gated integration tests import deps inside the test body
+]
+"src/main.py" = [
+    "T201",     # entry point script prints to stdout by design
+    "INP001",   # standalone entry script, not part of the package
+]
+"src/water_content_recorder/app.py" = [
+    "T201",     # entry point prints to stdout by design
+]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+exclude = ["shared_python"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.0",
+    "ty>=0.0.63",
+]
