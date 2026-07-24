@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { formatNanoseconds } from '$lib/format';
 	import ImpulseResponseChart from '$lib/ImpulseResponseChart.svelte';
+	import WaterContentTrendChart from '$lib/WaterContentTrendChart.svelte';
 
 	const API_URL = 'http://127.0.0.1:8000/latest';
 	const POLL_INTERVAL_MS = 1000;
@@ -48,7 +49,7 @@
 	});
 </script>
 
-<main class="mx-auto flex max-w-2xl flex-col gap-6 p-8">
+<main class="mx-auto flex max-w-6xl flex-col gap-6 p-8">
 	<header class="flex items-center justify-between">
 		<h1 class="text-xl font-semibold">Water Content Monitor</h1>
 		<span
@@ -69,17 +70,22 @@
 	{:else if !data}
 		<p class="text-gray-500">読み込み中...</p>
 	{:else}
-		<div class="grid grid-cols-2 gap-4">
-			<div class="border p-4">
-				<div class="text-sm text-gray-500">Water Content</div>
-				<div class="text-3xl font-bold">{data.water_content.toFixed(3)}</div>
+		<div class="grid grid-cols-2 items-stretch gap-6">
+			<div class="flex flex-col gap-6">
+				<div class="grid grid-cols-2 gap-4">
+					<div class="border p-4">
+						<div class="text-sm text-gray-500">Water Content</div>
+						<div class="text-3xl font-bold">{data.water_content.toFixed(3)}</div>
+					</div>
+					<div class="border p-4">
+						<div class="text-sm text-gray-500">Peak Distance</div>
+						<div class="text-3xl font-bold">{formatNanoseconds(data.peak_distance)}</div>
+					</div>
+				</div>
+				<ImpulseResponseChart x={data.d_axis} y={data.impulse_response} />
 			</div>
-			<div class="border p-4">
-				<div class="text-sm text-gray-500">Peak Distance</div>
-				<div class="text-3xl font-bold">{formatNanoseconds(data.peak_distance)}</div>
-			</div>
+			<WaterContentTrendChart />
 		</div>
-		<ImpulseResponseChart x={data.d_axis} y={data.impulse_response} />
 		{#if lastUpdated}
 			<p class="text-xs text-gray-400">最終更新: {lastUpdated.toLocaleTimeString()}</p>
 		{/if}

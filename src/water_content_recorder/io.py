@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import deque
+from datetime import UTC, datetime, timedelta
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import TYPE_CHECKING
@@ -15,6 +17,9 @@ if TYPE_CHECKING:
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_DECIMATE = 10
+HISTORY_WINDOW = timedelta(hours=1)
+HISTORY_MAX_POINTS = 300
+DEFAULT_STATIC_DIR = Path(__file__).resolve().parents[2] / "frontend" / "build"
 
 
 class SignalRecorder:
@@ -25,6 +30,7 @@ class SignalRecorder:
         self.output_dir = Path(output_dir)
         self._buffer: list[tuple[datetime, SignalState]] = []
         self._latest: SignalState | None = None
+        self._history: deque[tuple[datetime, float]] = deque()
 
     @property
     def latest(self) -> SignalState | None:
@@ -34,7 +40,12 @@ class SignalRecorder:
     def add(self, state: SignalState) -> None:
         """SignalStateをバッファに追加し、規定数に達したらparquetへ保存する。"""
         self._latest = state
-        self._buffer.append((datetime.now(UTC), state))
+        now = datetime.now(UTC)
+        self._buffer.append((now, state))
+        self._history.append((now, state.water_content))
+        cutoff = now - HISTORY_WINDOW
+        while self._history and self._history[0][0] < cutoff:
+            self._history.popleft()
         if len(self._buffer) >= self.buffer_size:
             self.flush()
 
@@ -67,6 +78,17 @@ class SignalRecorder:
             "water_content": state.water_content,
         }
 
+    def history_summary(self, max_points: int = HISTORY_MAX_POINTS) -> dict:
+        """直近1時間のwater_content推移を間引いてJSONで送りやすい辞書に変換する(フロントエンド配信用)。"""
+        entries = list(self._history)
+        if len(entries) > max_points:
+            step = len(entries) // max_points
+            entries = entries[::step]
+        return {
+            "timestamps": [timestamp.isoformat() for timestamp, _ in entries],
+            "water_content": [water_content for _, water_content in entries],
+        }
+
     @staticmethod
     def _to_dataframe(records: list[tuple[datetime, SignalState]]) -> pl.DataFrame:
         return pl.DataFrame(
@@ -90,21 +112,28 @@ def serve_latest_http(
     host: str = DEFAULT_HTTP_HOST,
     port: int = DEFAULT_HTTP_PORT,
     decimate: int = DEFAULT_DECIMATE,
+    static_dir: str | Path = DEFAULT_STATIC_DIR,
 ) -> ThreadingHTTPServer:
-    """recorder.latestを間引いたJSONとしてHTTPで公開する(GET /latest)。フロントエンドWebからのポーリングを想定。
+    """recorder.latestを間引いたJSONとしてHTTPで公開する(GET /latest, /history)。
+
+    それ以外のパスはstatic_dir(フロントエンドの `pnpm build` 成果物)を配信するので、
+    ブラウザで http://host:port/ を開くだけで監視画面が見られる。
 
     バックグラウンドスレッドでサーバーを起動し、呼び出し元はブロックしない。
     終了時は返り値の server.shutdown() を呼ぶこと。
     """
 
-    class LatestHandler(BaseHTTPRequestHandler):
-        """GET /latest に対して最新データをJSONで返すハンドラ。"""
+    class Handler(SimpleHTTPRequestHandler):
+        """GET /latest, /history はJSON API、それ以外はフロントエンドの静的ビルドを返す。"""
 
         def do_GET(self) -> None:
-            if self.path != "/latest":
-                self.send_error(404)
+            if self.path == "/latest":
+                payload = recorder.latest_summary(decimate)
+            elif self.path == "/history":
+                payload = recorder.history_summary()
+            else:
+                super().do_GET()
                 return
-            payload = recorder.latest_summary(decimate)
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -116,6 +145,7 @@ def serve_latest_http(
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             pass  # 標準出力を汚さないため無効化
 
-    server = ThreadingHTTPServer((host, port), LatestHandler)
+    handler_class = partial(Handler, directory=str(static_dir))
+    server = ThreadingHTTPServer((host, port), handler_class)
     Thread(target=server.serve_forever, daemon=True).start()
     return server

@@ -8,14 +8,15 @@
 
 <section class="chart-root border p-4">
 	<h2 class="mb-2 text-sm text-gray-500">Impulse Response</h2>
-	<div class="h-64 w-full">
+	<div class="h-72 w-full">
 		<LineChart
 			{data}
 			x="x"
 			y="y"
+			padding={{ left: 56, bottom: 48 }}
 			props={{
-				xAxis: { label: 'Distance (m)' },
-				yAxis: { label: 'Amplitude' }
+				xAxis: { label: 'Distance (m)', labelProps: { class: 'text-xs' } },
+				yAxis: { label: 'Amplitude', labelProps: { class: 'text-xs' } }
 			}}
 		/>
 	</div>

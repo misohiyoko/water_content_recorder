@@ -150,4 +150,4 @@ class SignalProcessing:
             return (peak_distance - 6.244e-10) / 1.552e-11
         if peak_distance <= 14.45e-10:
             return (peak_distance - 9.942e-10) / 7.42e-12
-        return (peak_distance - 2.589e-11) / 2.334e-11
+        return min((peak_distance - 2.589e-11) / 2.334e-11, 100.0)
