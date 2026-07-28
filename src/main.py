@@ -1,6 +1,6 @@
 import time
 
-from water_content_recorder.io import SignalRecorder, serve_latest_http
+from water_content_recorder.io import DEFAULT_STATIC_DIR, SignalRecorder, serve_latest_http
 from water_content_recorder.signal_proccesing import SignalProcessing
 from water_content_recorder.vna import open_device
 
@@ -22,6 +22,11 @@ def main():
     processor = SignalProcessing()
     recorder = SignalRecorder(buffer_size=BUFFER_SIZE)
     server = serve_latest_http(recorder, host=HTTP_HOST, port=HTTP_PORT, decimate=HTTP_DECIMATE)
+    if DEFAULT_STATIC_DIR.exists():
+        print(f"監視画面: http://{HTTP_HOST}:{HTTP_PORT}/ をブラウザで開いてください")
+    else:
+        print("警告: フロントエンドが未ビルドです。frontend で `pnpm build` を実行してください")
+        print(f"APIのみ起動しました: http://{HTTP_HOST}:{HTTP_PORT}/latest")
 
     try:
         while True:
@@ -30,7 +35,6 @@ def main():
             s11 = nv.data(0)
             state = processor.process_signal(nv.frequencies, s11)
             recorder.add(state)
-            print(recorder.latest)
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = INTERVAL_SEC - elapsed
