@@ -1,0 +1,21 @@
+{"asctime": "2026-07-31 10:10:16,322", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 10:10:16,369", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}
+{"asctime": "2026-07-31 10:12:23,822", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 74, "message": "停止要求を受け取りました。終了処理を行います。"}
+{"asctime": "2026-07-31 10:12:28,505", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 10:12:28,520", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}
+{"asctime": "2026-07-31 10:22:17,073", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 74, "message": "停止要求を受け取りました。終了処理を行います。"}
+{"asctime": "2026-07-31 10:22:50,069", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 10:22:50,085", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}
+{"asctime": "2026-07-31 11:30:03,638", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 74, "message": "停止要求を受け取りました。終了処理を行います。"}
+{"asctime": "2026-07-31 11:30:18,157", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 11:30:18,174", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}
+{"asctime": "2026-07-31 11:30:47,301", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 74, "message": "停止要求を受け取りました。終了処理を行います。"}
+{"asctime": "2026-07-31 11:30:47,450", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 79, "message": "終了しました。"}
+{"asctime": "2026-07-31 11:33:27,774", "name": "water_content_recorder", "levelname": "WARNING", "module": "main", "lineno": 35, "message": "デバイス接続に失敗: OSError('device not found'). 1秒後に再試行します。"}
+{"asctime": "2026-07-31 11:33:28,790", "name": "water_content_recorder", "levelname": "WARNING", "module": "main", "lineno": 35, "message": "デバイス接続に失敗: OSError('device not found'). 2秒後に再試行します。"}
+{"asctime": "2026-07-31 11:33:40,914", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 11:33:40,932", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}
+{"asctime": "2026-07-31 11:41:28,241", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 74, "message": "停止要求を受け取りました。終了処理を行います。"}
+{"asctime": "2026-07-31 11:41:28,459", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 79, "message": "終了しました。"}
+{"asctime": "2026-07-31 11:41:33,322", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 39, "message": "デバイスに接続しました。"}
+{"asctime": "2026-07-31 11:41:33,341", "name": "water_content_recorder", "levelname": "INFO", "module": "main", "lineno": 49, "message": "監視画面: http://127.0.0.1:5290/ をブラウザで開いてください"}

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { LineChart } from 'layerchart';
 
-	const API_URL = 'http://127.0.0.1:8000/history';
+	const API_URL = 'http://127.0.0.1:5290/history';
 	const POLL_INTERVAL_MS = 10_000;
 
 	type HistoryData = {

@@ -10,12 +10,15 @@ from threading import Thread
 from typing import TYPE_CHECKING
 
 import polars as pl
+from shared_python.log import get_logger
 
 if TYPE_CHECKING:
     from water_content_recorder.signal_proccesing import SignalState
 
+logger = get_logger(__name__)
+
 DEFAULT_HTTP_HOST = "127.0.0.1"
-DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PORT = 5290
 DEFAULT_DECIMATE = 10
 HISTORY_WINDOW = timedelta(hours=1)
 HISTORY_MAX_POINTS = 300
@@ -31,6 +34,7 @@ class SignalRecorder:
         self._buffer: list[tuple[datetime, SignalState]] = []
         self._latest: SignalState | None = None
         self._history: deque[tuple[datetime, float]] = deque()
+        self._session_start = datetime.now(UTC)
 
     @property
     def latest(self) -> SignalState | None:
@@ -56,10 +60,14 @@ class SignalRecorder:
 
         df = self._to_dataframe(self._buffer)
         timestamp, _ = self._buffer[-1]
-        day_dir = self.output_dir / f"{timestamp:%Y%m%d}"
+        day_dir = self.output_dir / f"{self._session_start:%Y%m%d}"
         day_dir.mkdir(parents=True, exist_ok=True)
         path = day_dir / f"records_{timestamp:%Y%m%dT%H%M%S}.parquet"
-        df.write_parquet(path)
+        try:
+            df.write_parquet(path)
+        except OSError:
+            logger.exception(f"parquetの書き込みに失敗しました: {path}")
+            return  # バッファは保持し、次回のflushで再試行する
         self._buffer.clear()
 
     def latest_summary(self, decimate: int = DEFAULT_DECIMATE) -> dict | None:
@@ -74,6 +82,7 @@ class SignalRecorder:
             "d_axis": state.d_axis[::decimate].tolist(),
             "step_response": state.step_response[::decimate].tolist(),
             "impulse_response": state.impulse_response[::decimate].tolist(),
+            "peak_positions": state.peak_positions,
             "peak_distance": state.peak_distance,
             "water_content": state.water_content,
         }
@@ -101,6 +110,7 @@ class SignalRecorder:
                 "d_axis": [state.d_axis.tolist() for _, state in records],
                 "step_response": [state.step_response.tolist() for _, state in records],
                 "impulse_response": [state.impulse_response.tolist() for _, state in records],
+                "peak_positions": [state.peak_positions for _, state in records],
                 "peak_distance": [state.peak_distance for _, state in records],
                 "water_content": [state.water_content for _, state in records],
             },

@@ -14,6 +14,7 @@ class SignalState:
     d_axis: np.ndarray
     step_response: np.ndarray
     impulse_response: np.ndarray
+    peak_positions: list[float]
     peak_distance: float
     water_content: float
 
@@ -26,7 +27,8 @@ class SignalProcessing:
 
     def process_signal(self, frequencies: np.ndarray, s11: np.ndarray) -> SignalState:
         t_axis, d_axis, step_response, impulse_response = self.compute_tdr(frequencies, s11)
-        peak_distance = self.get_peak_distance_ndarray(impulse_response, t_axis)
+        peak_positions = self.get_peak_positions(impulse_response, t_axis)
+        peak_distance = self.compute_peak_distance(peak_positions)
         water_content = self.compute_water_content(peak_distance)
         return SignalState(
             frequencies=frequencies,
@@ -35,6 +37,7 @@ class SignalProcessing:
             d_axis=d_axis,
             step_response=step_response,
             impulse_response=impulse_response,
+            peak_positions=peak_positions,
             peak_distance=peak_distance,
             water_content=water_content,
         )
@@ -103,19 +106,48 @@ class SignalProcessing:
 
         return t_axis[:valid], d_axis[:valid], step[:valid], impulse[:valid]
 
-    def get_peak_distance_ndarray(
+    def get_peak_positions(
         self,
         y_array: np.ndarray,
         x_array: np.ndarray,
-        peak1_rank: int = 0,
-        peak2_rank: int = 1,
-    ) -> float:
-        """ndarrayを入力として、指定した順位（高さ降順）のピーク間のxの距離を計算する。
+    ) -> list[float]:
+        """ndarrayを入力として、検出した全ピークのx位置を高さ降順で返す。
+
+        ピーク数は入力信号次第で任意個になる(多点ピーク検出への対応)。
 
         Parameters
         ----------
         - y_array (np.ndarray): y軸の配列
         - x_array (np.ndarray): x軸の配列 (元の time_ns に相当)
+
+        Returns
+        -------
+        - list[float]: 高さ降順に並んだピークのx位置。ピークが1つもなければ空リスト。
+
+        """
+        # 1. ピークのインデックスを取得
+        peaks, _ = find_peaks(y_array, prominence=0.0)
+        if len(peaks) == 0:
+            return []
+
+        # 2. ピークの高さ (yの値) を取得し、降順にソートしたインデックス配列を作成
+        peak_heights = y_array[peaks]
+        sorted_peak_indices = peaks[np.argsort(peak_heights)[::-1]]
+
+        # 3. 降順に並んだ各ピークのx位置を返す
+        return [float(x_array[i]) for i in sorted_peak_indices]
+
+    def compute_peak_distance(
+        self,
+        peak_positions: list[float],
+        peak1_rank: int = 0,
+        peak2_rank: int = 1,
+    ) -> float:
+        """高さ降順のピーク位置リストから、指定した順位のピーク間のxの距離を計算する。
+
+        Parameters
+        ----------
+        - peak_positions (list[float]): `get_peak_positions` が返す、高さ降順のピーク位置
         - peak1_rank (int): 比較する1つ目のピークの順位（0が最も高いピーク）
         - peak2_rank (int): 比較する2つ目のピークの順位（1が2番目に高いピーク）
 
@@ -124,22 +156,9 @@ class SignalProcessing:
         - float: ピーク間の距離（絶対値）。ピークが足りない場合は np.nan を返す。
 
         """
-        # 1. ピークのインデックスを取得
-        peaks, _ = find_peaks(y_array, prominence=0.0)
-
-        # ピーク数が指定した順位に満たない場合のエラー回避
-        if len(peaks) <= max(peak1_rank, peak2_rank):
+        if len(peak_positions) <= max(peak1_rank, peak2_rank):
             return np.nan
-
-        # 2. ピークの高さ (yの値) を取得し、降順にソートしたインデックス配列を作成
-        peak_heights = y_array[peaks]
-        sorted_peak_indices = peaks[np.argsort(peak_heights)[::-1]]
-
-        # 3. 指定された順位のピークに対応する x_array の値を取得して距離を計算
-        x1 = x_array[sorted_peak_indices[peak1_rank]]
-        x2 = x_array[sorted_peak_indices[peak2_rank]]
-
-        return abs(x1 - x2)
+        return abs(peak_positions[peak1_rank] - peak_positions[peak2_rank])
 
     def compute_water_content(self, peak_distance: float) -> float:
         if np.isnan(peak_distance):
@@ -147,7 +166,7 @@ class SignalProcessing:
         if peak_distance <= 0:
             return 0.0
         if peak_distance <= 13.33e-10:
-            return (peak_distance - 6.244e-10) / 1.552e-11
+            return max((peak_distance - 6.244e-10) / 1.552e-11, 0.0)
         if peak_distance <= 14.45e-10:
-            return (peak_distance - 9.942e-10) / 7.42e-12
+            return max((peak_distance - 9.942e-10) / 7.42e-12, 0.0)
         return min((peak_distance - 2.589e-11) / 2.334e-11, 100.0)

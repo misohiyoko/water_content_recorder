@@ -19,6 +19,11 @@ _LITEVNA_DEVICES = {
     (0x04B4, 0x0008),  # LiteVNA-64 / NanoVNA V2
 }
 
+# 1回だけの読み取り失敗(壊れたデータなど)。デバイスは生きているとみなし、次の周期でそのまま再試行する。
+TRANSIENT_READ_ERRORS = (ValueError, UnicodeDecodeError, struct.error, IndexError, AssertionError)
+# デバイスとの接続自体が失われた可能性がある(serial.SerialExceptionはOSErrorのサブクラス)。再接続が必要。
+CONNECTION_ERRORS = (OSError,)
+
 
 # Get nanovna device automatically
 def getport() -> str:
@@ -50,7 +55,7 @@ class NanoVNA:
 
     def open(self):
         if self.serial is None:
-            self.serial = serial.Serial(self.dev)
+            self.serial = serial.Serial(self.dev, timeout=5)
 
     def close(self):
         if self.serial:
@@ -277,7 +282,15 @@ class LiteVNA(NanoVNA):
         while remaining > 0:
             n = min(remaining, 255)
             self.serial.write(bytes([self._CMD_READFIFO, addr, n]))
-            result += self.serial.read(self._FIFO_BYTES * n)
+            expected = self._FIFO_BYTES * n
+            chunk = self.serial.read(expected)
+            if len(chunk) != expected:
+                msg = (
+                    f"FIFO読み取りが不足しています(要求={expected}バイト, 実際={len(chunk)}バイト)。"
+                    "デバイスの応答が遅延・停止した可能性があります。"
+                )
+                raise ValueError(msg)
+            result += chunk
             remaining -= n
         return result
 

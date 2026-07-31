@@ -4,7 +4,7 @@
 	import ImpulseResponseChart from '$lib/ImpulseResponseChart.svelte';
 	import WaterContentTrendChart from '$lib/WaterContentTrendChart.svelte';
 
-	const API_URL = 'http://127.0.0.1:8000/latest';
+	const API_URL = 'http://127.0.0.1:5290/latest';
 	const POLL_INTERVAL_MS = 1000;
 
 	type LatestData = {
