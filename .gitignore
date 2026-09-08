@@ -9,4 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
+# Local configuration (calibration coefficient, etc.)
+.env
+
 data/**

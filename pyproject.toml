@@ -13,6 +13,7 @@ dependencies = [
     "polars>=1.43.0",
     "pyarrow>=25.0.0",
     "pyserial>=3.5",
+    "python-dotenv>=1.2.2",
     "scikit-rf>=2.0.1",
     "scipy>=1.18.0",
     "scipy-stubs>=1.18.0.1",

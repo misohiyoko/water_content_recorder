@@ -20,10 +20,33 @@ class SignalState:
 
 
 class SignalProcessing:
-    def __init__(self, tdr_window: str = "hann", tdr_zero_pad_factor: int = 8, velocity_factor: float = 1.0):
+    # 水分量換算式(区分線形近似)の係数。compute_water_content と _invert_water_content の
+    # 両方から参照することで、キャリブレーション時の逆算がずれないようにしている。
+    _SEG1_UPPER = 13.33e-10
+    _SEG1_OFFSET = 6.244e-10
+    _SEG1_SLOPE = 1.552e-11
+    _SEG2_UPPER = 14.45e-10
+    _SEG2_OFFSET = 9.942e-10
+    _SEG2_SLOPE = 7.42e-12
+    _SEG3_OFFSET = 2.589e-11
+    _SEG3_SLOPE = 2.334e-11
+    _MAX_WATER_CONTENT = 100.0
+
+    def __init__(
+        self,
+        tdr_window: str = "hann",
+        tdr_zero_pad_factor: int = 8,
+        velocity_factor: float = 1.0,
+        calibration_coefficient: float = 1.0,
+        peak_min_distance: float = 0.7e-9,
+        peak_search_start_time: float = 2e-9,
+    ):
         self.tdr_window = tdr_window
         self.tdr_zero_pad_factor = tdr_zero_pad_factor
         self.velocity_factor = velocity_factor
+        self.calibration_coefficient = calibration_coefficient
+        self.peak_min_distance = peak_min_distance
+        self.peak_search_start_time = peak_search_start_time
 
     def process_signal(self, frequencies: np.ndarray, s11: np.ndarray) -> SignalState:
         t_axis, d_axis, step_response, impulse_response = self.compute_tdr(frequencies, s11)
@@ -114,6 +137,9 @@ class SignalProcessing:
         """ndarrayを入力として、検出した全ピークのx位置を高さ降順で返す。
 
         ピーク数は入力信号次第で任意個になる(多点ピーク検出への対応)。
+        `peak_search_start_time` 未満の範囲は不感帯としてピーク探索の対象外とする。
+        また、近接したピークの多重検出を防ぐため、`peak_min_distance` 未満の間隔で
+        隣り合うピークは高い方のみ残す。
 
         Parameters
         ----------
@@ -125,16 +151,25 @@ class SignalProcessing:
         - list[float]: 高さ降順に並んだピークのx位置。ピークが1つもなければ空リスト。
 
         """
-        # 1. ピークのインデックスを取得
-        peaks, _ = find_peaks(y_array, prominence=0.0)
+        # 1. 不感帯(peak_search_start_time)より手前の区間を探索対象から除外
+        dx = x_array[1] - x_array[0]
+        start_index = int(np.searchsorted(x_array, self.peak_search_start_time))
+        y_search = y_array[start_index:]
+
+        # 2. 近接ピークの最小間隔(peak_min_distance)をサンプル数に変換
+        min_distance_samples = max(1, round(self.peak_min_distance / dx))
+
+        # 3. ピークのインデックスを取得(最小間隔より近いピークは高い方のみ残す)
+        peaks, _ = find_peaks(y_search, prominence=0.0, distance=min_distance_samples)
+        peaks += start_index
         if len(peaks) == 0:
             return []
 
-        # 2. ピークの高さ (yの値) を取得し、降順にソートしたインデックス配列を作成
+        # 4. ピークの高さ (yの値) を取得し、降順にソートしたインデックス配列を作成
         peak_heights = y_array[peaks]
         sorted_peak_indices = peaks[np.argsort(peak_heights)[::-1]]
 
-        # 3. 降順に並んだ各ピークのx位置を返す
+        # 5. 降順に並んだ各ピークのx位置を返す
         return [float(x_array[i]) for i in sorted_peak_indices]
 
     def compute_peak_distance(
@@ -163,10 +198,59 @@ class SignalProcessing:
     def compute_water_content(self, peak_distance: float) -> float:
         if np.isnan(peak_distance):
             return np.nan
+        # 水分量の換算式は区間ごとに非線形なため、校正は出力ではなくpeak_distance側にかける
+        peak_distance *= self.calibration_coefficient
         if peak_distance <= 0:
             return 0.0
-        if peak_distance <= 13.33e-10:
-            return max((peak_distance - 6.244e-10) / 1.552e-11, 0.0)
-        if peak_distance <= 14.45e-10:
-            return max((peak_distance - 9.942e-10) / 7.42e-12, 0.0)
-        return min((peak_distance - 2.589e-11) / 2.334e-11, 100.0)
+        if peak_distance <= self._SEG1_UPPER:
+            return max((peak_distance - self._SEG1_OFFSET) / self._SEG1_SLOPE, 0.0)
+        if peak_distance <= self._SEG2_UPPER:
+            return max((peak_distance - self._SEG2_OFFSET) / self._SEG2_SLOPE, 0.0)
+        return min((peak_distance - self._SEG3_OFFSET) / self._SEG3_SLOPE, self._MAX_WATER_CONTENT)
+
+    def _invert_water_content(self, water_content: float) -> float:
+        """compute_water_content の区分線形近似を逆算する。
+
+        目標のwater_content(%)に対応する、校正係数適用後のpeak_distanceを返す
+        (calibration_coefficient自体は含まない)。
+
+        Parameters
+        ----------
+        - water_content (float): 目標とする水分量(%)
+
+        Returns
+        -------
+        - float: その水分量に対応する校正後peak_distance(秒)
+
+        """
+        if water_content <= 0.0:
+            return 0.0
+        # 区分の境界に対応する水分量を求め、どの区分の式を使うか判定する
+        water_content_at_seg1_upper = (self._SEG1_UPPER - self._SEG1_OFFSET) / self._SEG1_SLOPE
+        water_content_at_seg2_upper = (self._SEG2_UPPER - self._SEG2_OFFSET) / self._SEG2_SLOPE
+        if water_content <= water_content_at_seg1_upper:
+            return water_content * self._SEG1_SLOPE + self._SEG1_OFFSET
+        if water_content <= water_content_at_seg2_upper:
+            return water_content * self._SEG2_SLOPE + self._SEG2_OFFSET
+        return water_content * self._SEG3_SLOPE + self._SEG3_OFFSET
+
+    def calibrate(self, raw_peak_distance: float, reference_water_content: float) -> float:
+        """別方式で測定した水分量を基準に calibration_coefficient を再算出して設定する。
+
+        Parameters
+        ----------
+        - raw_peak_distance (float): 校正係数を掛ける前のpeak_distance(秒)
+          (`SignalState.peak_distance` は校正前の値なのでそのまま渡せる)
+        - reference_water_content (float): 別方式で測定した水分量(%)
+
+        Returns
+        -------
+        - float: 新しく設定されたcalibration_coefficient
+
+        """
+        if np.isnan(raw_peak_distance) or raw_peak_distance <= 0:
+            msg = f"calibrate: 不正なraw_peak_distanceです: {raw_peak_distance}"
+            raise ValueError(msg)
+        target_peak_distance = self._invert_water_content(reference_water_content)
+        self.calibration_coefficient = target_peak_distance / raw_peak_distance
+        return self.calibration_coefficient
