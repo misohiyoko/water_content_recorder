@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -13,8 +14,10 @@ from shared_python import make_progress, setup_logger
 WATER_CONTENT_COLOR = "#eb6834"
 IMPULSE_RESPONSE_COLOR = "#2a78d6"
 PEAK_MARKER_COLOR = "#eb6834"
-# スペクトログラム(インパルス応答ヒートマップ)用の配色(plotly組み込みのInferno)
+# スペクトログラム(インパルス応答/周波数応答ヒートマップ)用の配色(plotly組み込みのInferno)
 SPECTROGRAM_COLORSCALE = "Inferno"
+# スペクトログラムを対数(dB)表示する際の下限。これより弱い振幅は下限に張り付かせて表示する
+SPECTROGRAM_DB_FLOOR = -60.0
 # スライダーのラベルが重なって読めなくなるのを防ぐため、この件数を超えたら間引いてラベル表示する
 MAX_LABELED_SLIDER_STEPS = 30
 # 長時間測定でも特定区間へズームしやすいよう、レンジスライダーとプリセットボタンを付ける
@@ -35,10 +38,10 @@ _TIME_RANGE_AXIS_OPTIONS = {
 def postprocess(
     data_path: str | Path,
     output_path: str | Path,
-    max_impulse_frames: int = 200,
-    max_trend_points: int = 5000,
+    max_impulse_frames: int = 800,
+    max_trend_points: int = 20000,
 ) -> None:
-    """parquetファイル群を読み込み、結合したparquet・water_contentの時間変化(CSV・グラフ)・impulse_responseの波形をグラフ出力する。"""
+    """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形・各種スペクトログラムを出力する。"""
     data_path = Path(data_path)
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -71,6 +74,9 @@ def postprocess(
         impulse_df = combined_df[frame_indices].select(
             ["timestamp", "t_axis", "impulse_response", "peak_positions"],
         )
+        spectrum_df = combined_df[frame_indices].select(
+            ["timestamp", "frequencies", "s11_real", "s11_imag"],
+        )
         progress.update(task, completed=1, total=1)
         logger.info(f"波形グラフ用に {impulse_df.height} 件のレコードを間引いて読み込みました")
 
@@ -91,6 +97,79 @@ def postprocess(
 
     _write_spectrogram_html(impulse_df, trend_plot_df, output_path / "spectrogram.html")
     logger.info("spectrogram.html を出力しました")
+
+    _write_frequency_spectrogram_html(spectrum_df, trend_plot_df, output_path / "frequency_spectrogram.html")
+    logger.info("frequency_spectrogram.html を出力しました")
+
+
+def _zoom_rescale_script(div_id: str, targets: list[dict]) -> str:
+    """ズーム(レンジスライダー/プリセット/ドラッグ)時に、表示範囲内のデータでy軸・ヒートマップの色範囲を自動調整するJS。
+
+    plotlyはx軸をズームしてもy軸/色範囲を追随させないため、埋め込み済みのtrace data(gd.data)から
+    表示範囲内の値を都度計算し直し、Plotly.relayout/restyleで更新する。
+    targetsの各要素は {"type": "line", "trace": idx, "yaxis": "yaxis"|"yaxis2"} または
+    {"type": "heatmap", "trace": idx, "floor_db": float}。
+    """
+    return f"""
+(function() {{
+    var gd = document.getElementById({div_id!r});
+    var targets = {json.dumps(targets)};
+    function toMs(v) {{ return (v instanceof Date) ? v.getTime() : new Date(v).getTime(); }}
+    function getXRange(ed) {{
+        var lo, hi, reset = false;
+        Object.keys(ed).forEach(function(k) {{
+            if (/^xaxis\\d*\\.autorange$/.test(k) && ed[k]) reset = true;
+            if (/^xaxis\\d*\\.range\\[0\\]$/.test(k)) lo = ed[k];
+            if (/^xaxis\\d*\\.range\\[1\\]$/.test(k)) hi = ed[k];
+            if (/^xaxis\\d*\\.range$/.test(k) && Array.isArray(ed[k])) {{ lo = ed[k][0]; hi = ed[k][1]; }}
+        }});
+        if (reset) return null;
+        if (lo === undefined || hi === undefined) return undefined;
+        return [toMs(lo), toMs(hi)];
+    }}
+    gd.on('plotly_relayout', function(ed) {{
+        var xr = getXRange(ed);
+        if (xr === undefined) return;
+        targets.forEach(function(t) {{
+            var trace = gd.data[t.trace];
+            if (xr === null) {{
+                if (t.type === 'line') {{
+                    var reset_update = {{}};
+                    reset_update[t.yaxis + '.autorange'] = true;
+                    Plotly.relayout(gd, reset_update);
+                }}
+                return;
+            }}
+            var colIdx = [];
+            for (var i = 0; i < trace.x.length; i++) {{
+                var tm = toMs(trace.x[i]);
+                if (tm >= xr[0] && tm <= xr[1]) colIdx.push(i);
+            }}
+            if (colIdx.length === 0) return;
+            if (t.type === 'line') {{
+                var vals = colIdx.map(function(i) {{ return trace.y[i]; }});
+                var mn = Math.min.apply(null, vals), mx = Math.max.apply(null, vals);
+                var pad = (mx - mn) * 0.05 || Math.abs(mx) * 0.05 || 1;
+                var update = {{}};
+                update[t.yaxis + '.range'] = [mn - pad, mx + pad];
+                update[t.yaxis + '.autorange'] = false;
+                Plotly.relayout(gd, update);
+            }} else if (t.type === 'heatmap') {{
+                var zmn = Infinity, zmx = -Infinity;
+                colIdx.forEach(function(i) {{
+                    trace.z.forEach(function(row) {{
+                        var v = row[i];
+                        if (v < zmn) zmn = v;
+                        if (v > zmx) zmx = v;
+                    }});
+                }});
+                if (!isFinite(zmn) || !isFinite(zmx)) return;
+                Plotly.restyle(gd, {{zmin: [Math.max(zmn, t.floor_db)], zmax: [zmx]}}, [t.trace]);
+            }}
+        }});
+    }});
+}})();
+"""
 
 
 def _evenly_spaced_indices(n_rows: int, max_points: int) -> list[int]:
@@ -128,7 +207,9 @@ def _write_water_content_html(trend_df: pl.DataFrame, path: Path) -> None:
     fig = go.Figure(
         go.Scatter(
             x=trend_df["timestamp"],
-            y=trend_df["water_content"],
+            # ズーム時にJS側(gd.data)からyの値を読み直すため、plotlyのnumpy用バイナリ圧縮(dtype/bdata)を
+            # 避けて素のJSON配列にする(list化しないとブラウザ側でtrace.y[i]がundefinedになる)
+            y=trend_df["water_content"].to_list(),
             mode="lines",
             line={"color": WATER_CONTENT_COLOR, "width": 2},
             name="Water Content",
@@ -142,7 +223,12 @@ def _write_water_content_html(trend_df: pl.DataFrame, path: Path) -> None:
         yaxis_title="Water Content (%)",
         hovermode="x unified",
     )
-    fig.write_html(path, include_plotlyjs=True)
+    fig.write_html(
+        path,
+        include_plotlyjs=True,
+        div_id="water_content_trend",
+        post_script=_zoom_rescale_script("water_content_trend", [{"type": "line", "trace": 0, "yaxis": "yaxis"}]),
+    )
 
 
 def _nearest_y(t_axis: np.ndarray, impulse_response: np.ndarray, peak_x: float) -> float:
@@ -237,16 +323,50 @@ def _write_impulse_response_html(impulse_df: pl.DataFrame, path: Path) -> None:
     fig.write_html(path, include_plotlyjs=True)
 
 
+def _to_db(z_linear: np.ndarray, floor_db: float = SPECTROGRAM_DB_FLOOR) -> np.ndarray:
+    """振幅の配列を、全体の最大値を0dBとした対数(dB)スケールに変換する。
+
+    floor_dbより弱い振幅はfloor_dbに張り付かせ、微弱なノイズ成分を強調しすぎないようにする。
+    """
+    z_abs = np.abs(z_linear)
+    peak = np.max(z_abs)
+    ref = peak if peak > 0 else 1.0
+    ratio = np.maximum(z_abs / ref, 10 ** (floor_db / 20))
+    return 20 * np.log10(ratio)
+
+
+def _add_water_content_row(fig: go.Figure, trend_df: pl.DataFrame, *, row: int, col: int) -> None:
+    """スペクトログラムの下段に、時間軸を共有した水分量トレンドを追加する(共通処理)。"""
+    peak_distance_ns = trend_df["peak_distance"].to_numpy() * 1e9
+    fig.add_trace(
+        go.Scatter(
+            x=trend_df["timestamp"],
+            # 理由は_write_water_content_html関数と同じ、ズーム時JS側で読めるよう素のJSON配列にする
+            y=trend_df["water_content"].to_list(),
+            mode="lines",
+            line={"color": WATER_CONTENT_COLOR, "width": 2},
+            name="Water Content",
+            customdata=peak_distance_ns,
+            hovertemplate="Water Content: %{y:.3f}%<br>Peak Distance: %{customdata:.3f} ns<extra></extra>",
+        ),
+        row=row,
+        col=col,
+    )
+    fig.update_yaxes(title_text="Water Content (%)", row=row, col=col)
+    # 下段(共有x軸)にレンジスライダー/プリセットを付け、長時間測定でも区間を選んでズームできるようにする
+    fig.update_xaxes(title_text="Time", row=row, col=col, **_TIME_RANGE_AXIS_OPTIONS)
+
+
 def _write_spectrogram_html(impulse_df: pl.DataFrame, trend_df: pl.DataFrame, path: Path) -> None:
     """インパルス応答をスペクトログラムとして水分量トレンドと時間軸を揃えて重ねて表示する。
 
-    上段: 時間 x 遅延時間 のヒートマップ(色=振幅)
+    上段: 時間 x 遅延時間 のヒートマップ(色=振幅、対数(dB)表示)
     下段: 水分量の時間変化(上段と同じ時間軸を共有し、ズーム連動する)
     """
     timestamps = impulse_df["timestamp"].to_list()
     # t_axisは計測設定が同じであればレコード間で共通のため、先頭行のものを使う
     t_axis_ns = np.asarray(impulse_df["t_axis"][0]) * 1e9
-    z = np.array(impulse_df["impulse_response"].to_list()).T
+    z_db = _to_db(np.array(impulse_df["impulse_response"].to_list()).T)
 
     fig = make_subplots(
         rows=2,
@@ -260,41 +380,98 @@ def _write_spectrogram_html(impulse_df: pl.DataFrame, trend_df: pl.DataFrame, pa
         go.Heatmap(
             x=timestamps,
             y=t_axis_ns,
-            z=z,
+            # ズームJSがgd.data[].zを読むため、numpy用バイナリ圧縮を避けて素のJSON配列にする
+            z=z_db.tolist(),
+            zmin=SPECTROGRAM_DB_FLOOR,
+            zmax=0.0,
             colorscale=SPECTROGRAM_COLORSCALE,
-            colorbar={"title": "Amplitude", "len": 0.55, "y": 0.82},
-            hovertemplate="Time=%{x}<br>Delay=%{y:.3f} ns<br>Amplitude=%{z:.4f}<extra></extra>",
+            colorbar={"title": "Amplitude (dB)", "len": 0.55, "y": 0.82},
+            hovertemplate="Time=%{x}<br>Delay=%{y:.3f} ns<br>Amplitude=%{z:.1f} dB<extra></extra>",
             name="Impulse Response",
         ),
         row=1,
         col=1,
     )
-
-    peak_distance_ns = trend_df["peak_distance"].to_numpy() * 1e9
-    fig.add_trace(
-        go.Scatter(
-            x=trend_df["timestamp"],
-            y=trend_df["water_content"],
-            mode="lines",
-            line={"color": WATER_CONTENT_COLOR, "width": 2},
-            name="Water Content",
-            customdata=peak_distance_ns,
-            hovertemplate="Water Content: %{y:.3f}%<br>Peak Distance: %{customdata:.3f} ns<extra></extra>",
-        ),
-        row=2,
-        col=1,
-    )
-
     fig.update_yaxes(title_text="Delay (ns)", row=1, col=1)
-    fig.update_yaxes(title_text="Water Content (%)", row=2, col=1)
-    # 下段(共有x軸)にレンジスライダー/プリセットを付け、長時間測定でも区間を選んでズームできるようにする
-    fig.update_xaxes(title_text="Time", row=2, col=1, **_TIME_RANGE_AXIS_OPTIONS)
+
+    _add_water_content_row(fig, trend_df, row=2, col=1)
     fig.update_layout(
         template="plotly_white",
         height=800,
         hovermode="x unified",
     )
-    fig.write_html(path, include_plotlyjs=True)
+    fig.write_html(
+        path,
+        include_plotlyjs=True,
+        div_id="spectrogram",
+        post_script=_zoom_rescale_script(
+            "spectrogram",
+            [
+                {"type": "heatmap", "trace": 0, "floor_db": SPECTROGRAM_DB_FLOOR},
+                {"type": "line", "trace": 1, "yaxis": "yaxis2"},
+            ],
+        ),
+    )
+
+
+def _write_frequency_spectrogram_html(spectrum_df: pl.DataFrame, trend_df: pl.DataFrame, path: Path) -> None:
+    """時間ごとのS11(周波数応答)をスペクトログラムとして水分量トレンドと時間軸を揃えて重ねて表示する。
+
+    上段: 時間 x 周波数 のヒートマップ(色=|S11|、対数(dB)表示)
+    下段: 水分量の時間変化(上段と同じ時間軸を共有し、ズーム連動する)
+    """
+    timestamps = spectrum_df["timestamp"].to_list()
+    # frequenciesは計測設定が同じであればレコード間で共通のため、先頭行のものを使う
+    frequencies_mhz = np.asarray(spectrum_df["frequencies"][0]) / 1e6
+    s11_real = np.array(spectrum_df["s11_real"].to_list())
+    s11_imag = np.array(spectrum_df["s11_imag"].to_list())
+    s11_mag = np.abs(s11_real + 1j * s11_imag)
+    z_db = _to_db(s11_mag.T)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        vertical_spacing=0.06,
+        subplot_titles=("S11 Frequency Spectrogram", "Water Content"),
+    )
+    fig.add_trace(
+        go.Heatmap(
+            x=timestamps,
+            y=frequencies_mhz,
+            # 理由は_write_spectrogram_html関数と同じ、ズーム時JS側で読めるよう素のJSON配列にする
+            z=z_db.tolist(),
+            zmin=SPECTROGRAM_DB_FLOOR,
+            zmax=0.0,
+            colorscale=SPECTROGRAM_COLORSCALE,
+            colorbar={"title": "|S11| (dB)", "len": 0.55, "y": 0.82},
+            hovertemplate="Time=%{x}<br>Frequency=%{y:.1f} MHz<br>|S11|=%{z:.1f} dB<extra></extra>",
+            name="S11 Magnitude",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(title_text="Frequency (MHz)", row=1, col=1)
+
+    _add_water_content_row(fig, trend_df, row=2, col=1)
+    fig.update_layout(
+        template="plotly_white",
+        height=800,
+        hovermode="x unified",
+    )
+    fig.write_html(
+        path,
+        include_plotlyjs=True,
+        div_id="frequency_spectrogram",
+        post_script=_zoom_rescale_script(
+            "frequency_spectrogram",
+            [
+                {"type": "heatmap", "trace": 0, "floor_db": SPECTROGRAM_DB_FLOOR},
+                {"type": "line", "trace": 1, "yaxis": "yaxis2"},
+            ],
+        ),
+    )
 
 
 if __name__ == "__main__":
@@ -306,14 +483,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-impulse-frames",
         type=int,
-        default=200,
-        help="インパルス応答スライダー/スペクトログラムに使う間引き後のフレーム数(既定値: 200)",
+        default=800,
+        help="インパルス応答スライダー/スペクトログラムに使う間引き後のフレーム数(既定値: 800)",
     )
     parser.add_argument(
         "--max-trend-points",
         type=int,
-        default=5000,
-        help="水分量トレンドグラフ(PNG/HTML)に使う間引き後の点数(既定値: 5000)",
+        default=20000,
+        help="水分量トレンドグラフ(PNG/HTML)に使う間引き後の点数(既定値: 20000)",
     )
     args = parser.parse_args()
     postprocess(args.data_path, args.output_path, args.max_impulse_frames, args.max_trend_points)
