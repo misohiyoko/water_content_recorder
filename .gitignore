@@ -13,3 +13,8 @@ wheels/
 .env
 
 data/**
+
+# 実行時に生成される成果物(環境ごとの結果なので追跡しない)
+logs/
+output/
+*.log
