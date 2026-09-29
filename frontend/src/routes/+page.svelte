@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { resolve } from '$app/paths';
 	import { formatNanoseconds } from '$lib/format';
 	import ImpulseResponseChart from '$lib/ImpulseResponseChart.svelte';
 	import WaterContentTrendChart from '$lib/WaterContentTrendChart.svelte';
@@ -99,15 +100,18 @@
 <main class="mx-auto flex max-w-6xl flex-col gap-6 p-8">
 	<header class="flex items-center justify-between">
 		<h1 class="text-xl font-semibold">Water Content Monitor</h1>
-		<span
-			class="flex items-center gap-2 text-sm"
-			class:text-green-600={!error}
-			class:text-red-600={!!error}
-		>
-			<span class="h-2 w-2 rounded-full" class:bg-green-600={!error} class:bg-red-600={!!error}
-			></span>
-			{error ? '切断' : '接続中'}
-		</span>
+		<div class="flex items-center gap-4">
+			<a href={resolve('/postprocess')} class="text-sm text-blue-600 underline">後処理</a>
+			<span
+				class="flex items-center gap-2 text-sm"
+				class:text-green-600={!error}
+				class:text-red-600={!!error}
+			>
+				<span class="h-2 w-2 rounded-full" class:bg-green-600={!error} class:bg-red-600={!!error}
+				></span>
+				{error ? '切断' : '接続中'}
+			</span>
+		</div>
 	</header>
 
 	<div class="flex flex-wrap items-center gap-4 border p-3 text-sm">

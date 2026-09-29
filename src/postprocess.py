@@ -1,5 +1,8 @@
 import json
+from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -20,6 +23,9 @@ SPECTROGRAM_COLORSCALE = "Inferno"
 SPECTROGRAM_DB_FLOOR = -60.0
 # スライダーのラベルが重なって読めなくなるのを防ぐため、この件数を超えたら間引いてラベル表示する
 MAX_LABELED_SLIDER_STEPS = 30
+# water_contentがこの値以上(=ピーク誤検出などでcompute_water_contentが100%にクリップされた異常値)の
+# レコードは、グラフを歪めるためcombined.parquet以外の出力から除外する
+WATER_CONTENT_CLIP_THRESHOLD = 100.0
 # 長時間測定でも特定区間へズームしやすいよう、レンジスライダーとプリセットボタンを付ける
 _TIME_RANGE_AXIS_OPTIONS = {
     "rangeslider": {"visible": True},
@@ -36,45 +42,81 @@ _TIME_RANGE_AXIS_OPTIONS = {
 
 
 def postprocess(
-    data_path: str | Path,
+    data_path: str | Path | Sequence[str | Path],
     output_path: str | Path,
     max_impulse_frames: int = 800,
     max_trend_points: int = 20000,
+    water_content_clip_threshold: float = WATER_CONTENT_CLIP_THRESHOLD,
+    start_time: str | datetime | None = None,
+    end_time: str | datetime | None = None,
 ) -> None:
-    """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形・各種スペクトログラムを出力する。"""
-    data_path = Path(data_path)
+    """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形・各種スペクトログラムを出力する。
+
+    data_pathは単一フォルダ、または複数フォルダ(list等)を渡せる。複数指定した場合は
+    全フォルダのparquetを1つに結合してから処理する。start_time/end_timeを指定すると、
+    結合後のデータをその時刻範囲(両端含む)だけに絞り込んでから以降の処理・出力を行う。
+    """
+    data_paths = [Path(data_path)] if isinstance(data_path, (str, Path)) else [Path(p) for p in data_path]
+    start_time = datetime.fromisoformat(start_time) if isinstance(start_time, str) else start_time
+    end_time = datetime.fromisoformat(end_time) if isinstance(end_time, str) else end_time
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     console = Console()
     logger = setup_logger("postprocess", log_file=output_path / "postprocess.log", console=console)
-    if not data_path.exists():
-        msg = f"{data_path} が見つかりません"
-        raise FileNotFoundError(msg)
 
-    parquet_files = sorted(data_path.glob("*.parquet"))
+    parquet_files = []
+    for path in data_paths:
+        if not path.exists():
+            msg = f"{path} が見つかりません"
+            raise FileNotFoundError(msg)
+        parquet_files.extend(sorted(path.glob("*.parquet")))
     if not parquet_files:
-        msg = f"{data_path} にparquetファイルが見つかりません"
+        msg = f"{data_paths} にparquetファイルが見つかりません"
         raise FileNotFoundError(msg)
     logger.info(f"parquetファイルを {len(parquet_files)} 件見つけました")
 
     with make_progress(console=console, transient=True) as progress:
         task = progress.add_task("parquetファイルを結合中", total=None)
         combined_df = pl.scan_parquet(parquet_files).sort("timestamp").collect()
+        # timestamp列はタイムゾーン付きなので、tz無しで指定された範囲もそれに合わせて解釈する
+        tz = combined_df.schema["timestamp"].time_zone
+        if start_time is not None and start_time.tzinfo is None and tz is not None:
+            start_time = start_time.replace(tzinfo=ZoneInfo(tz))
+        if end_time is not None and end_time.tzinfo is None and tz is not None:
+            end_time = end_time.replace(tzinfo=ZoneInfo(tz))
+        if start_time is not None:
+            combined_df = combined_df.filter(pl.col("timestamp") >= start_time)
+        if end_time is not None:
+            combined_df = combined_df.filter(pl.col("timestamp") <= end_time)
         progress.update(task, completed=1, total=1)
 
         n_rows = combined_df.height
+        if n_rows == 0:
+            msg = "指定された範囲にレコードがありません"
+            raise ValueError(msg)
         logger.info(f"{n_rows} 件のレコードを読み込みました")
 
-        trend_df = combined_df.select(["timestamp", "water_content", "peak_distance"])
-        trend_plot_df = trend_df[_evenly_spaced_indices(n_rows, max_trend_points)]
+        # water_contentがcompute_water_content側で100%にクリップされた異常値(ピーク誤検出等)を
+        # グラフ用データから除外する。combined.parquetには影響しない(生データのまま出力する)
+        plot_df = combined_df.filter(pl.col("water_content") < water_content_clip_threshold)
+        n_clipped = n_rows - plot_df.height
+        if n_clipped:
+            logger.info(
+                f"water_contentが{water_content_clip_threshold}%以上のレコードを"
+                f"{n_clipped}件、グラフ用データから除外しました",
+            )
+        n_plot_rows = plot_df.height
+
+        trend_df = plot_df.select(["timestamp", "water_content", "peak_distance"])
+        trend_plot_df = trend_df[_evenly_spaced_indices(n_plot_rows, max_trend_points)]
         logger.info(f"グラフ用に水分量トレンドを {trend_plot_df.height} 件に間引きました")
 
         task = progress.add_task("インパルス応答の波形を読み込み中", total=None)
-        frame_indices = _evenly_spaced_indices(n_rows, max_impulse_frames)
-        impulse_df = combined_df[frame_indices].select(
+        frame_indices = _evenly_spaced_indices(n_plot_rows, max_impulse_frames)
+        impulse_df = plot_df[frame_indices].select(
             ["timestamp", "t_axis", "impulse_response", "peak_positions"],
         )
-        spectrum_df = combined_df[frame_indices].select(
+        spectrum_df = plot_df[frame_indices].select(
             ["timestamp", "frequencies", "s11_real", "s11_imag"],
         )
         progress.update(task, completed=1, total=1)
@@ -478,7 +520,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="記録済みparquetファイルからグラフを生成する")
-    parser.add_argument("data_path", help="parquetファイルが置かれたディレクトリ")
+    parser.add_argument(
+        "data_path",
+        nargs="+",
+        help="parquetファイルが置かれたディレクトリ(複数指定すると結合して処理する)",
+    )
     parser.add_argument("output_path", help="グラフの出力先ディレクトリ")
     parser.add_argument(
         "--max-impulse-frames",
@@ -492,5 +538,24 @@ if __name__ == "__main__":
         default=20000,
         help="水分量トレンドグラフ(PNG/HTML)に使う間引き後の点数(既定値: 20000)",
     )
+    parser.add_argument(
+        "--water-content-clip-threshold",
+        type=float,
+        default=WATER_CONTENT_CLIP_THRESHOLD,
+        help=(
+            "water_contentがこの値以上(compute_water_content側でクリップされた異常値)の"
+            f"レコードをグラフから除外する(既定値: {WATER_CONTENT_CLIP_THRESHOLD})"
+        ),
+    )
+    parser.add_argument("--start-time", help="この時刻(ISO8601)以降のレコードのみ処理する")
+    parser.add_argument("--end-time", help="この時刻(ISO8601)以前のレコードのみ処理する")
     args = parser.parse_args()
-    postprocess(args.data_path, args.output_path, args.max_impulse_frames, args.max_trend_points)
+    postprocess(
+        args.data_path,
+        args.output_path,
+        args.max_impulse_frames,
+        args.max_trend_points,
+        args.water_content_clip_threshold,
+        args.start_time,
+        args.end_time,
+    )

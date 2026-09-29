@@ -8,6 +8,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import polars as pl
 from shared_python.log import get_logger
@@ -24,6 +25,7 @@ DEFAULT_HTTP_PORT = 5290
 DEFAULT_DECIMATE = 10
 HISTORY_WINDOW = timedelta(hours=1)
 HISTORY_MAX_POINTS = 300
+PREVIEW_MAX_POINTS = 2000
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parents[2] / "frontend" / "build"
 
 
@@ -100,6 +102,15 @@ class SignalRecorder:
         postprocess(self.session_dir, export_dir)
         return export_dir
 
+    def list_data_folders(self) -> list[str]:
+        """self.output_dir直下でparquetファイルを直接持つディレクトリ名一覧を新しい順に返す(postprocess対象選択用)。"""
+        if not self.output_dir.exists():
+            return []
+        return sorted(
+            (p.name for p in self.output_dir.iterdir() if p.is_dir() and next(p.glob("*.parquet"), None)),
+            reverse=True,
+        )
+
     def latest_summary(self, decimate: int = DEFAULT_DECIMATE) -> dict | None:
         """最新のSignalStateを間引いてJSONで送りやすい辞書に変換する(フロントエンド配信用)。"""
         state = self._latest
@@ -169,13 +180,21 @@ def serve_latest_http(
     """
 
     class Handler(SimpleHTTPRequestHandler):
-        """GET /latest, /history と POST /export, /calibrate はJSON API、それ以外は静的ビルドを返す。"""
+        """GET /latest, /history, /data-folders(/preview) と POST /export, /calibrate, /postprocess は
+        JSON API、それ以外は静的ビルドを返す。
+        """
 
         def do_GET(self) -> None:
-            if self.path == "/latest":
+            parsed = urlsplit(self.path)
+            if parsed.path == "/latest":
                 payload = recorder.latest_summary(decimate)
-            elif self.path == "/history":
+            elif parsed.path == "/history":
                 payload = recorder.history_summary()
+            elif parsed.path == "/data-folders":
+                payload = {"folders": recorder.list_data_folders()}
+            elif parsed.path == "/data-folders/preview":
+                self._handle_data_folders_preview(parse_qs(parsed.query))
+                return
             else:
                 super().do_GET()
                 return
@@ -186,6 +205,8 @@ def serve_latest_http(
                 self._handle_export()
             elif self.path == "/calibrate":
                 self._handle_calibrate()
+            elif self.path == "/postprocess":
+                self._handle_postprocess()
             else:
                 self.send_error(404)
 
@@ -197,6 +218,59 @@ def serve_latest_http(
                 self._send_json({"error": "エクスポートに失敗しました"}, status=500)
                 return
             self._send_json({"output_dir": str(export_dir)})
+
+        def _handle_data_folders_preview(self, query: dict[str, list[str]]) -> None:
+            dirs = [d for d in query.get("dirs", [""])[0].split(",") if d]
+            if not dirs:
+                self._send_json({"error": "dirsが指定されていません"}, status=400)
+                return
+            parquet_files = []
+            for name in dirs:
+                path = recorder.output_dir / name
+                if not path.exists():
+                    self._send_json({"error": f"{path} が見つかりません"}, status=400)
+                    return
+                parquet_files.extend(sorted(path.glob("*.parquet")))
+            if not parquet_files:
+                self._send_json({"error": "parquetファイルが見つかりません"}, status=400)
+                return
+            from postprocess import _evenly_spaced_indices  # noqa: PLC0415 (重いためこの時だけ読み込む)
+
+            df = pl.scan_parquet(parquet_files).select(["timestamp", "water_content"]).sort("timestamp").collect()
+            df = df[_evenly_spaced_indices(df.height, PREVIEW_MAX_POINTS)]
+            self._send_json(
+                {
+                    "timestamps": [t.isoformat() for t in df["timestamp"].to_list()],
+                    "water_content": df["water_content"].to_list(),
+                },
+            )
+
+        def _handle_postprocess(self) -> None:
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                dirs = body["dirs"]
+                if not isinstance(dirs, list) or not dirs or not all(isinstance(d, str) for d in dirs):
+                    raise ValueError  # noqa: TRY301
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                self._send_json({"error": "dirsが不正です"}, status=400)
+                return
+            paths = [recorder.output_dir / d for d in dirs]
+            output_dir = recorder.output_dir / f"{'_'.join(dirs)}_output"
+            try:
+                from postprocess import postprocess  # noqa: PLC0415 (重いためこの時だけ読み込む)
+
+                postprocess(
+                    paths,
+                    output_dir,
+                    start_time=body.get("start_time") or None,
+                    end_time=body.get("end_time") or None,
+                )
+            except Exception:  # postprocess由来の様々な例外をJSONエラーとして返す
+                logger.exception("postprocessに失敗しました")
+                self._send_json({"error": "postprocessに失敗しました"}, status=500)
+                return
+            self._send_json({"output_dir": str(output_dir)})
 
         def _handle_calibrate(self) -> None:
             if on_calibrate is None:
