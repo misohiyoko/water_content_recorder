@@ -22,7 +22,7 @@ PEAK_MIN_DISTANCE = 0.7e-9  # 近接ピークを区別する最小間隔(秒)
 
 LOG_FILE = Path("logs") / "water_content_recorder.log"
 RECONNECT_INITIAL_DELAY = 1.0
-RECONNECT_MAX_DELAY = 60.0
+RECONNECT_MAX_DELAY = 10.0
 ENV_PATH = Path(".env")
 
 load_dotenv(ENV_PATH)
@@ -49,7 +49,6 @@ def open_device_with_retry():
 
 
 def main():
-    nv = open_device_with_retry()
     processor = SignalProcessing(
         calibration_coefficient=CALIBRATION_COEFFICIENT,
         peak_search_start_time=PEAK_SEARCH_START_TIME,
@@ -69,6 +68,8 @@ def main():
         logger.info(f"校正係数を再設定しました: {new_coefficient} (基準water_content={reference_water_content})")
         return new_coefficient
 
+    # 機器接続(open_device_with_retry)は繋がるまでブロックするため、先にサーバーを立ち上げる。
+    # こうすることで、機器未接続でもフロントエンド(後処理メニュー等)にはすぐアクセスできる。
     server = serve_latest_http(
         recorder,
         host=HTTP_HOST,
@@ -82,6 +83,7 @@ def main():
         logger.warning("フロントエンドが未ビルドです。frontend で `pnpm build` を実行してください")
         logger.info(f"APIのみ起動しました: http://{HTTP_HOST}:{HTTP_PORT}/latest")
 
+    nv = open_device_with_retry()
     try:
         while True:
             loop_start = time.perf_counter()

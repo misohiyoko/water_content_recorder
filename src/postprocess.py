@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import polars as pl
-from plotly.subplots import make_subplots
 from rich.console import Console
 
 from shared_python import make_progress, setup_logger
@@ -17,15 +16,19 @@ from shared_python import make_progress, setup_logger
 WATER_CONTENT_COLOR = "#eb6834"
 IMPULSE_RESPONSE_COLOR = "#2a78d6"
 PEAK_MARKER_COLOR = "#eb6834"
-# スペクトログラム(インパルス応答/周波数応答ヒートマップ)用の配色(plotly組み込みのInferno)
-SPECTROGRAM_COLORSCALE = "Inferno"
-# スペクトログラムを対数(dB)表示する際の下限。これより弱い振幅は下限に張り付かせて表示する
-SPECTROGRAM_DB_FLOOR = -60.0
 # スライダーのラベルが重なって読めなくなるのを防ぐため、この件数を超えたら間引いてラベル表示する
 MAX_LABELED_SLIDER_STEPS = 30
 # water_contentがこの値以上(=ピーク誤検出などでcompute_water_contentが100%にクリップされた異常値)の
 # レコードは、グラフを歪めるためcombined.parquet以外の出力から除外する
 WATER_CONTENT_CLIP_THRESHOLD = 100.0
+# combined.parquet書き出し時の行グループサイズ。Polarsのparquet書き出しは既定だと1ファイル分を
+# 丸ごと1行グループとしてメモリ上に構築してから圧縮するため、大量データではここがメモリの支配的な
+# ボトルネックになる。SignalRecorderの1parquetファイルあたりの行数(main.pyのBUFFER_SIZE)に
+# 合わせておくと、出力側が入力ファイル1つ分ずつだけ処理すればよくなり最もメモリ効率が良い
+# (実測: 2フォルダ/15,763行で、値200だと書き出しピーク1.35GB/17.6秒、
+# BUFFER_SIZEに合わせた50だと0.45GB/9.8秒。ファイルサイズはほぼ同じ)。
+# ponytail: 固定値による簡易チューニング。BUFFER_SIZEを変更した場合はこちらも合わせて変更すること。
+COMBINED_PARQUET_ROW_GROUP_SIZE = 50
 # 長時間測定でも特定区間へズームしやすいよう、レンジスライダーとプリセットボタンを付ける
 _TIME_RANGE_AXIS_OPTIONS = {
     "rangeslider": {"visible": True},
@@ -50,13 +53,13 @@ def postprocess(
     start_time: str | datetime | None = None,
     end_time: str | datetime | None = None,
 ) -> None:
-    """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形・各種スペクトログラムを出力する。
+    """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形を出力する。
 
     data_pathは単一フォルダ、または複数フォルダ(list等)を渡せる。複数指定した場合は
     全フォルダのparquetを1つに結合してから処理する。start_time/end_timeを指定すると、
     結合後のデータをその時刻範囲(両端含む)だけに絞り込んでから以降の処理・出力を行う。
     """
-    data_paths = [Path(data_path)] if isinstance(data_path, (str, Path)) else [Path(p) for p in data_path]
+    data_paths = [Path(data_path)] if isinstance(data_path, (str, Path)) else sorted(Path(p) for p in data_path)
     start_time = datetime.fromisoformat(start_time) if isinstance(start_time, str) else start_time
     end_time = datetime.fromisoformat(end_time) if isinstance(end_time, str) else end_time
     output_path = Path(output_path)
@@ -77,53 +80,89 @@ def postprocess(
 
     with make_progress(console=console, transient=True) as progress:
         task = progress.add_task("parquetファイルを結合中", total=None)
-        combined_df = pl.scan_parquet(parquet_files).sort("timestamp").collect()
+
+        # 各ファイルは記録順(時系列順)に書き出され、フォルダ・ファイル名も時系列順にソート済みのため、
+        # 通常はtimestampで明示的にソートし直さなくてもすでに時系列順になっている。
+        # 明示的なsort("timestamp")は全件をメモリに展開してしまう(Polarsのストリーミングエンジンは
+        # ソートをストリーミング処理できず、この時点で全データがメモリに載ってしまう)ため、
+        # timestamp列だけ軽量に読んで順序を確認し、崩れている場合のみソートする(フォールバック)。
+        timestamps = pl.scan_parquet(parquet_files).select("timestamp").collect()["timestamp"]
+        if timestamps.is_sorted():
+            combined_lazy = pl.scan_parquet(parquet_files)
+        else:
+            logger.warning(
+                "timestampの並びがファイル順と一致しないため、ソートします(メモリ使用量が増えます)",
+            )
+            combined_lazy = pl.scan_parquet(parquet_files).sort("timestamp")
+
         # timestamp列はタイムゾーン付きなので、tz無しで指定された範囲もそれに合わせて解釈する
-        tz = combined_df.schema["timestamp"].time_zone
+        tz = combined_lazy.collect_schema()["timestamp"].time_zone
         if start_time is not None and start_time.tzinfo is None and tz is not None:
             start_time = start_time.replace(tzinfo=ZoneInfo(tz))
         if end_time is not None and end_time.tzinfo is None and tz is not None:
             end_time = end_time.replace(tzinfo=ZoneInfo(tz))
         if start_time is not None:
-            combined_df = combined_df.filter(pl.col("timestamp") >= start_time)
+            combined_lazy = combined_lazy.filter(pl.col("timestamp") >= start_time)
         if end_time is not None:
-            combined_df = combined_df.filter(pl.col("timestamp") <= end_time)
+            combined_lazy = combined_lazy.filter(pl.col("timestamp") <= end_time)
+
+        # 全件を一度にプロセスメモリへ展開せず、ストリーミングでcombined.parquetへ直接書き出す
+        # (data_pathの合計が数十GBあってもここでメモリを使い切らないようにするため)
+        combined_path = output_path / "combined.parquet"
+        combined_lazy.sink_parquet(combined_path, row_group_size=COMBINED_PARQUET_ROW_GROUP_SIZE)
         progress.update(task, completed=1, total=1)
 
-        n_rows = combined_df.height
+        # 行数はメタデータから取得するだけなので、ここでも全件はメモリに載らない
+        n_rows = pl.scan_parquet(combined_path).select(pl.len()).collect().item()
         if n_rows == 0:
+            combined_path.unlink(missing_ok=True)
             msg = "指定された範囲にレコードがありません"
             raise ValueError(msg)
         logger.info(f"{n_rows} 件のレコードを読み込みました")
+        logger.info("combined.parquet を出力しました")
 
-        # water_contentがcompute_water_content側で100%にクリップされた異常値(ピーク誤検出等)を
-        # グラフ用データから除外する。combined.parquetには影響しない(生データのまま出力する)
-        plot_df = combined_df.filter(pl.col("water_content") < water_content_clip_threshold)
-        n_clipped = n_rows - plot_df.height
+        # 1回目: 軽量な列(timestamp/water_content/peak_distance)だけを全件読み込む。
+        # 1行あたりのサイズが小さいため、行数がどれだけ多くてもこの読み込みでメモリを使い切ることはない。
+        # water_contentがcompute_water_content側で100%にクリップされた異常値(ピーク誤検出等)は、
+        # グラフ用データから除外する(combined.parquetには影響しない、生データのまま出力済み)。
+        task = progress.add_task("水分量トレンドを読み込み中", total=None)
+        light_df = (
+            pl.scan_parquet(combined_path)
+            .with_row_index("__row__")
+            .filter(pl.col("water_content") < water_content_clip_threshold)
+            .select(["__row__", "timestamp", "water_content", "peak_distance"])
+            .collect()
+        )
+        n_clipped = n_rows - light_df.height
         if n_clipped:
             logger.info(
                 f"water_contentが{water_content_clip_threshold}%以上のレコードを"
                 f"{n_clipped}件、グラフ用データから除外しました",
             )
-        n_plot_rows = plot_df.height
+        n_plot_rows = light_df.height
 
-        trend_df = plot_df.select(["timestamp", "water_content", "peak_distance"])
+        trend_df = light_df.select(["timestamp", "water_content", "peak_distance"])
         trend_plot_df = trend_df[_evenly_spaced_indices(n_plot_rows, max_trend_points)]
         logger.info(f"グラフ用に水分量トレンドを {trend_plot_df.height} 件に間引きました")
+        progress.update(task, completed=1, total=1)
 
+        # 2回目: インパルス応答用の重い列(1行あたり数万点の配列)は、
+        # 間引き後に実際に使う行(既定で最大800行)だけをピンポイントで読み込む。
+        # combined_df/plot_dfのように全行×重い列をまとめてメモリに載せることは行わない。
+        # コマの選び方は均等間隔ではなく、water_contentが実際に変化した場面を優先する。
         task = progress.add_task("インパルス応答の波形を読み込み中", total=None)
-        frame_indices = _evenly_spaced_indices(n_plot_rows, max_impulse_frames)
-        impulse_df = plot_df[frame_indices].select(
-            ["timestamp", "t_axis", "impulse_response", "peak_positions"],
-        )
-        spectrum_df = plot_df[frame_indices].select(
-            ["timestamp", "frequencies", "s11_real", "s11_imag"],
+        frame_indices = _water_content_change_indices(light_df, max_impulse_frames)
+        target_rows = light_df["__row__"][frame_indices].to_list()
+        impulse_df = (
+            pl.scan_parquet(combined_path)
+            .with_row_index("__row__")
+            .filter(pl.col("__row__").is_in(target_rows))
+            .sort("__row__")  # フィルタ後も時系列順を保つ(並列実行時の順序ゆらぎ対策)
+            .select(["timestamp", "t_axis", "impulse_response", "peak_positions"])
+            .collect()
         )
         progress.update(task, completed=1, total=1)
         logger.info(f"波形グラフ用に {impulse_df.height} 件のレコードを間引いて読み込みました")
-
-    _write_combined_parquet(combined_df, output_path / "combined.parquet")
-    logger.info("combined.parquet を出力しました")
 
     _write_water_content_csv(trend_df, output_path / "water_content_trend.csv")
     logger.info("water_content_trend.csv を出力しました")
@@ -136,12 +175,6 @@ def postprocess(
 
     _write_impulse_response_html(impulse_df, output_path / "impulse_response.html")
     logger.info("impulse_response.html を出力しました")
-
-    _write_spectrogram_html(impulse_df, trend_plot_df, output_path / "spectrogram.html")
-    logger.info("spectrogram.html を出力しました")
-
-    _write_frequency_spectrogram_html(spectrum_df, trend_plot_df, output_path / "frequency_spectrogram.html")
-    logger.info("frequency_spectrogram.html を出力しました")
 
 
 def _zoom_rescale_script(div_id: str, targets: list[dict]) -> str:
@@ -220,8 +253,18 @@ def _evenly_spaced_indices(n_rows: int, max_points: int) -> list[int]:
     return sorted(set(np.linspace(0, n_rows - 1, num=n, dtype=int).tolist()))
 
 
-def _write_combined_parquet(combined_df: pl.DataFrame, path: Path) -> None:
-    combined_df.write_parquet(path)
+def _water_content_change_indices(light_df: pl.DataFrame, max_points: int) -> list[int]:
+    """water_contentの変化量(|Δ|)が大きい行を優先して選び、最大max_points件の
+    インデックス(0始まり、時系列順)を返す。値がほぼ動いていない区間にコマ数を割かず、
+    実際に変化した場面にコマ数を割り当てるための間引き方法。先頭・末尾は変化量によらず必ず含める。
+    """
+    n = light_df.height
+    if n <= max_points:
+        return list(range(n))
+    deltas = light_df["water_content"].diff().abs().fill_null(0.0).to_numpy()
+    order = [int(i) for i in np.argsort(-deltas) if i not in (0, n - 1)]
+    budget = max(max_points - 2, 0)
+    return sorted({0, n - 1, *order[:budget]})
 
 
 def _write_water_content_csv(trend_df: pl.DataFrame, path: Path) -> None:
@@ -363,157 +406,6 @@ def _write_impulse_response_html(impulse_df: pl.DataFrame, path: Path) -> None:
         ),
     )
     fig.write_html(path, include_plotlyjs=True)
-
-
-def _to_db(z_linear: np.ndarray, floor_db: float = SPECTROGRAM_DB_FLOOR) -> np.ndarray:
-    """振幅の配列を、全体の最大値を0dBとした対数(dB)スケールに変換する。
-
-    floor_dbより弱い振幅はfloor_dbに張り付かせ、微弱なノイズ成分を強調しすぎないようにする。
-    """
-    z_abs = np.abs(z_linear)
-    peak = np.max(z_abs)
-    ref = peak if peak > 0 else 1.0
-    ratio = np.maximum(z_abs / ref, 10 ** (floor_db / 20))
-    return 20 * np.log10(ratio)
-
-
-def _add_water_content_row(fig: go.Figure, trend_df: pl.DataFrame, *, row: int, col: int) -> None:
-    """スペクトログラムの下段に、時間軸を共有した水分量トレンドを追加する(共通処理)。"""
-    peak_distance_ns = trend_df["peak_distance"].to_numpy() * 1e9
-    fig.add_trace(
-        go.Scatter(
-            x=trend_df["timestamp"],
-            # 理由は_write_water_content_html関数と同じ、ズーム時JS側で読めるよう素のJSON配列にする
-            y=trend_df["water_content"].to_list(),
-            mode="lines",
-            line={"color": WATER_CONTENT_COLOR, "width": 2},
-            name="Water Content",
-            customdata=peak_distance_ns,
-            hovertemplate="Water Content: %{y:.3f}%<br>Peak Distance: %{customdata:.3f} ns<extra></extra>",
-        ),
-        row=row,
-        col=col,
-    )
-    fig.update_yaxes(title_text="Water Content (%)", row=row, col=col)
-    # 下段(共有x軸)にレンジスライダー/プリセットを付け、長時間測定でも区間を選んでズームできるようにする
-    fig.update_xaxes(title_text="Time", row=row, col=col, **_TIME_RANGE_AXIS_OPTIONS)
-
-
-def _write_spectrogram_html(impulse_df: pl.DataFrame, trend_df: pl.DataFrame, path: Path) -> None:
-    """インパルス応答をスペクトログラムとして水分量トレンドと時間軸を揃えて重ねて表示する。
-
-    上段: 時間 x 遅延時間 のヒートマップ(色=振幅、対数(dB)表示)
-    下段: 水分量の時間変化(上段と同じ時間軸を共有し、ズーム連動する)
-    """
-    timestamps = impulse_df["timestamp"].to_list()
-    # t_axisは計測設定が同じであればレコード間で共通のため、先頭行のものを使う
-    t_axis_ns = np.asarray(impulse_df["t_axis"][0]) * 1e9
-    z_db = _to_db(np.array(impulse_df["impulse_response"].to_list()).T)
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        row_heights=[0.65, 0.35],
-        vertical_spacing=0.06,
-        subplot_titles=("Impulse Response Spectrogram", "Water Content"),
-    )
-    fig.add_trace(
-        go.Heatmap(
-            x=timestamps,
-            y=t_axis_ns,
-            # ズームJSがgd.data[].zを読むため、numpy用バイナリ圧縮を避けて素のJSON配列にする
-            z=z_db.tolist(),
-            zmin=SPECTROGRAM_DB_FLOOR,
-            zmax=0.0,
-            colorscale=SPECTROGRAM_COLORSCALE,
-            colorbar={"title": "Amplitude (dB)", "len": 0.55, "y": 0.82},
-            hovertemplate="Time=%{x}<br>Delay=%{y:.3f} ns<br>Amplitude=%{z:.1f} dB<extra></extra>",
-            name="Impulse Response",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.update_yaxes(title_text="Delay (ns)", row=1, col=1)
-
-    _add_water_content_row(fig, trend_df, row=2, col=1)
-    fig.update_layout(
-        template="plotly_white",
-        height=800,
-        hovermode="x unified",
-    )
-    fig.write_html(
-        path,
-        include_plotlyjs=True,
-        div_id="spectrogram",
-        post_script=_zoom_rescale_script(
-            "spectrogram",
-            [
-                {"type": "heatmap", "trace": 0, "floor_db": SPECTROGRAM_DB_FLOOR},
-                {"type": "line", "trace": 1, "yaxis": "yaxis2"},
-            ],
-        ),
-    )
-
-
-def _write_frequency_spectrogram_html(spectrum_df: pl.DataFrame, trend_df: pl.DataFrame, path: Path) -> None:
-    """時間ごとのS11(周波数応答)をスペクトログラムとして水分量トレンドと時間軸を揃えて重ねて表示する。
-
-    上段: 時間 x 周波数 のヒートマップ(色=|S11|、対数(dB)表示)
-    下段: 水分量の時間変化(上段と同じ時間軸を共有し、ズーム連動する)
-    """
-    timestamps = spectrum_df["timestamp"].to_list()
-    # frequenciesは計測設定が同じであればレコード間で共通のため、先頭行のものを使う
-    frequencies_mhz = np.asarray(spectrum_df["frequencies"][0]) / 1e6
-    s11_real = np.array(spectrum_df["s11_real"].to_list())
-    s11_imag = np.array(spectrum_df["s11_imag"].to_list())
-    s11_mag = np.abs(s11_real + 1j * s11_imag)
-    z_db = _to_db(s11_mag.T)
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        row_heights=[0.65, 0.35],
-        vertical_spacing=0.06,
-        subplot_titles=("S11 Frequency Spectrogram", "Water Content"),
-    )
-    fig.add_trace(
-        go.Heatmap(
-            x=timestamps,
-            y=frequencies_mhz,
-            # 理由は_write_spectrogram_html関数と同じ、ズーム時JS側で読めるよう素のJSON配列にする
-            z=z_db.tolist(),
-            zmin=SPECTROGRAM_DB_FLOOR,
-            zmax=0.0,
-            colorscale=SPECTROGRAM_COLORSCALE,
-            colorbar={"title": "|S11| (dB)", "len": 0.55, "y": 0.82},
-            hovertemplate="Time=%{x}<br>Frequency=%{y:.1f} MHz<br>|S11|=%{z:.1f} dB<extra></extra>",
-            name="S11 Magnitude",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.update_yaxes(title_text="Frequency (MHz)", row=1, col=1)
-
-    _add_water_content_row(fig, trend_df, row=2, col=1)
-    fig.update_layout(
-        template="plotly_white",
-        height=800,
-        hovermode="x unified",
-    )
-    fig.write_html(
-        path,
-        include_plotlyjs=True,
-        div_id="frequency_spectrogram",
-        post_script=_zoom_rescale_script(
-            "frequency_spectrogram",
-            [
-                {"type": "heatmap", "trace": 0, "floor_db": SPECTROGRAM_DB_FLOOR},
-                {"type": "line", "trace": 1, "yaxis": "yaxis2"},
-            ],
-        ),
-    )
 
 
 if __name__ == "__main__":
