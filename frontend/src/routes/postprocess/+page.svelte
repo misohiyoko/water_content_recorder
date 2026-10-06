@@ -12,20 +12,28 @@
 	let loadError = $state<string | null>(null);
 	const selected = new SvelteSet<string>();
 
-	let points = $state<{ time: Date; water_content: number }[]>([]);
+	let points = $state<{ time: Date; water_content: number | null }[]>([]);
 	let previewState = $state<'idle' | 'loading' | 'error'>('idle');
 	let previewMessage = $state('');
 
 	let startTime = $state('');
 	let endTime = $state('');
 
+	// サーバーとの時刻のやり取りはUNIX時刻(ms)で行い、日時の入力・表示だけをブラウザのローカル時刻(JST)で行う
+	const toMs = (v: string) => (v ? new Date(v).getTime() : undefined);
+	// 古いリクエストの応答が後から届いて表示を上書きしないよう、最新のリクエスト番号だけを採用する
+	let previewSeq = 0;
+	let rangeTimer: ReturnType<typeof setTimeout> | undefined;
+
 	type RunState = 'idle' | 'loading' | 'success' | 'error';
 	let runState = $state<RunState>('idle');
 	let runMessage = $state('');
+	let generateCombinedParquet = $state(true);
+	let generateImpulseResponse = $state(true);
 
 	function toLocalInputValue(date: Date): string {
 		const pad = (n: number) => String(n).padStart(2, '0');
-		return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+		return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 	}
 
 	async function loadFolders() {
@@ -43,33 +51,48 @@
 	function toggleFolder(name: string, checked: boolean) {
 		if (checked) selected.add(name);
 		else selected.delete(name);
-		loadPreview();
+		loadPreview(true);
 	}
 
-	async function loadPreview() {
+	// 開始/終了時刻が変わったら、その範囲だけを再取得する(全体の間引き済みデータを絞ると点が粗くなるため)
+	function onRangeChange() {
+		clearTimeout(rangeTimer);
+		rangeTimer = setTimeout(() => loadPreview(false), 300);
+	}
+
+	// resetRange: フォルダ選択が変わったときは範囲を全体に戻す。範囲変更時は入力値で絞り込んで取得する
+	async function loadPreview(resetRange: boolean) {
+		const seq = ++previewSeq;
 		if (selected.size === 0) {
 			points = [];
 			return;
 		}
 		previewState = 'loading';
 		try {
-			const dirs = [...selected].join(',');
-			const res = await fetch(`${PREVIEW_URL}?dirs=${encodeURIComponent(dirs)}`);
+			const params = new URLSearchParams({ dirs: [...selected].join(',') });
+			const startMs = resetRange ? undefined : toMs(startTime);
+			const endMs = resetRange ? undefined : toMs(endTime);
+			if (startMs !== undefined) params.set('start_ms', String(startMs));
+			if (endMs !== undefined) params.set('end_ms', String(endMs));
+			const res = await fetch(`${PREVIEW_URL}?${params}`);
 			const payload = (await res.json()) as {
-				timestamps?: string[];
-				water_content?: number[];
+				times_ms?: number[];
+				water_content?: (number | null)[];
 				error?: string;
 			};
+			if (seq !== previewSeq) return;
 			if (!res.ok) throw new Error(payload.error ?? `HTTP ${res.status}`);
-			const timestamps = payload.timestamps ?? [];
+			const timesMs = payload.times_ms ?? [];
 			const waterContent = payload.water_content ?? [];
-			points = timestamps.map((t, i) => ({ time: new Date(t), water_content: waterContent[i] }));
-			if (points.length > 0) {
+			points = timesMs.map((t, i) => ({ time: new Date(t), water_content: waterContent[i] }));
+			if (resetRange && points.length > 0) {
 				startTime = toLocalInputValue(points[0].time);
-				endTime = toLocalInputValue(points[points.length - 1].time);
+				// 入力は秒単位なので、最後のレコードが範囲から漏れないよう終了は秒の切り上げにする
+				endTime = toLocalInputValue(new Date(Math.ceil(timesMs[timesMs.length - 1] / 1000) * 1000));
 			}
 			previewState = 'idle';
 		} catch (e) {
+			if (seq !== previewSeq) return;
 			previewState = 'error';
 			previewMessage = e instanceof Error ? e.message : String(e);
 		}
@@ -83,8 +106,10 @@
 				method: 'POST',
 				body: JSON.stringify({
 					dirs: [...selected],
-					start_time: startTime || undefined,
-					end_time: endTime || undefined
+					start_ms: toMs(startTime),
+					end_ms: toMs(endTime),
+					generate_combined_parquet: generateCombinedParquet,
+					generate_impulse_response: generateImpulseResponse
 				})
 			});
 			const payload = (await res.json()) as { output_dir?: string; error?: string };
@@ -148,7 +173,7 @@
 							y="water_content"
 							padding={{ left: 56, bottom: 48 }}
 							props={{
-								xAxis: { label: 'Time', labelProps: { class: 'text-xs' } },
+								xAxis: { label: 'Time (JST)', labelProps: { class: 'text-xs' } },
 								yAxis: { label: 'Water Content', labelProps: { class: 'text-xs' } }
 							}}
 						/>
@@ -158,12 +183,37 @@
 				<div class="flex flex-wrap items-center gap-4">
 					<div class="flex items-center gap-2">
 						<label for="start-time" class="text-gray-500">開始</label>
-						<input id="start-time" type="datetime-local" bind:value={startTime} class="border px-2 py-1" />
+						<input
+							id="start-time"
+							type="datetime-local"
+							step="1"
+							bind:value={startTime}
+							oninput={onRangeChange}
+							class="border px-2 py-1"
+						/>
 					</div>
 					<div class="flex items-center gap-2">
 						<label for="end-time" class="text-gray-500">終了</label>
-						<input id="end-time" type="datetime-local" bind:value={endTime} class="border px-2 py-1" />
+						<input
+							id="end-time"
+							type="datetime-local"
+							step="1"
+							bind:value={endTime}
+							oninput={onRangeChange}
+							class="border px-2 py-1"
+						/>
 					</div>
+				</div>
+
+				<div class="flex flex-wrap items-center gap-4 text-gray-500">
+					<label class="flex items-center gap-2">
+						<input type="checkbox" bind:checked={generateCombinedParquet} />
+						combined.parquetを出力する
+					</label>
+					<label class="flex items-center gap-2">
+						<input type="checkbox" bind:checked={generateImpulseResponse} />
+						impulse_response.htmlを出力する
+					</label>
 				</div>
 
 				<button

@@ -4,6 +4,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import matplotlib as mpl
+
+# HTTPサーバーのワーカースレッドからも呼ばれるため、GUIを使わないバックエンドにする(Tk等はメインスレッド以外で落ちる)
+mpl.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,9 +22,11 @@ IMPULSE_RESPONSE_COLOR = "#2a78d6"
 PEAK_MARKER_COLOR = "#eb6834"
 # スライダーのラベルが重なって読めなくなるのを防ぐため、この件数を超えたら間引いてラベル表示する
 MAX_LABELED_SLIDER_STEPS = 30
-# water_contentがこの値以上(=ピーク誤検出などでcompute_water_contentが100%にクリップされた異常値)の
-# レコードは、グラフを歪めるためcombined.parquet以外の出力から除外する
-WATER_CONTENT_CLIP_THRESHOLD = 100.0
+# peak_distance(ピーク間距離、ns)がこの値を超えるレコードは、ピーク誤検出等による異常値として
+# グラフを歪めるためcombined.parquet以外の出力から除外する。water_contentはcompute_water_content
+# 側で100%に頭打ちされてしまい、どれだけ異常な値でも同じ100.0になって区別がつかなくなるため、
+# クリップされる前の生の信号であるpeak_distanceの方を見て判定する。
+PEAK_DISTANCE_CLIP_THRESHOLD_NS = 10.0
 # combined.parquet書き出し時の行グループサイズ。Polarsのparquet書き出しは既定だと1ファイル分を
 # 丸ごと1行グループとしてメモリ上に構築してから圧縮するため、大量データではここがメモリの支配的な
 # ボトルネックになる。SignalRecorderの1parquetファイルあたりの行数(main.pyのBUFFER_SIZE)に
@@ -29,6 +35,12 @@ WATER_CONTENT_CLIP_THRESHOLD = 100.0
 # BUFFER_SIZEに合わせた50だと0.45GB/9.8秒。ファイルサイズはほぼ同じ)。
 # ponytail: 固定値による簡易チューニング。BUFFER_SIZEを変更した場合はこちらも合わせて変更すること。
 COMBINED_PARQUET_ROW_GROUP_SIZE = 50
+# combined.parquetの圧縮方式。既定のzstdは圧縮率が良い分CPU時間がかかり、大量データでは
+# ここが支配的な処理時間になる。実測(3フォルダ/70ファイル)ではlz4がzstdより約45%速く、
+# ファイルサイズは13%増える程度だったため、速度を優先してlz4を既定にしている。
+COMBINED_PARQUET_COMPRESSION = "lz4"
+# 記録時のtimestampはUTCで保存されている(実体はUNIX時刻)。出力はすべて日本時間に揃える
+JST_TZ = "Asia/Tokyo"
 # 長時間測定でも特定区間へズームしやすいよう、レンジスライダーとプリセットボタンを付ける
 _TIME_RANGE_AXIS_OPTIONS = {
     "rangeslider": {"visible": True},
@@ -49,15 +61,20 @@ def postprocess(
     output_path: str | Path,
     max_impulse_frames: int = 800,
     max_trend_points: int = 20000,
-    water_content_clip_threshold: float = WATER_CONTENT_CLIP_THRESHOLD,
+    peak_distance_clip_threshold_ns: float = PEAK_DISTANCE_CLIP_THRESHOLD_NS,
     start_time: str | datetime | None = None,
     end_time: str | datetime | None = None,
+    *,
+    generate_combined_parquet: bool = True,
+    generate_impulse_response: bool = True,
 ) -> None:
     """parquetファイル群を読み込み、結合parquet・water_content推移・impulse_response波形を出力する。
 
     data_pathは単一フォルダ、または複数フォルダ(list等)を渡せる。複数指定した場合は
     全フォルダのparquetを1つに結合してから処理する。start_time/end_timeを指定すると、
     結合後のデータをその時刻範囲(両端含む)だけに絞り込んでから以降の処理・出力を行う。
+    generate_combined_parquet/generate_impulse_responseをFalseにすると、それぞれの出力を
+    スキップして処理時間を短縮できる(データ量が多いときに時間がかかりやすい2つの出力)。
     """
     data_paths = [Path(data_path)] if isinstance(data_path, (str, Path)) else sorted(Path(p) for p in data_path)
     start_time = datetime.fromisoformat(start_time) if isinstance(start_time, str) else start_time
@@ -94,55 +111,79 @@ def postprocess(
                 "timestampの並びがファイル順と一致しないため、ソートします(メモリ使用量が増えます)",
             )
             combined_lazy = pl.scan_parquet(parquet_files).sort("timestamp")
+        # 表示上のタイムゾーンだけをJSTに変える(値=UNIX時刻は変わらない)。以降の出力はすべてJSTになる
+        combined_lazy = combined_lazy.with_columns(pl.col("timestamp").dt.convert_time_zone(JST_TZ))
 
-        # timestamp列はタイムゾーン付きなので、tz無しで指定された範囲もそれに合わせて解釈する
-        tz = combined_lazy.collect_schema()["timestamp"].time_zone
-        if start_time is not None and start_time.tzinfo is None and tz is not None:
-            start_time = start_time.replace(tzinfo=ZoneInfo(tz))
-        if end_time is not None and end_time.tzinfo is None and tz is not None:
-            end_time = end_time.replace(tzinfo=ZoneInfo(tz))
+        # timestamp列はJSTなので、tz無しで指定された範囲はJSTとして解釈する
+        # (polarsはタイムゾーンが異なるdatetime同士を比較できないため、tz付きの指定もJSTへ変換する)
+        jst = ZoneInfo(JST_TZ)
+        start_time, end_time = (
+            None if t is None else t.replace(tzinfo=jst) if t.tzinfo is None else t.astimezone(jst)
+            for t in (start_time, end_time)
+        )
         if start_time is not None:
             combined_lazy = combined_lazy.filter(pl.col("timestamp") >= start_time)
         if end_time is not None:
             combined_lazy = combined_lazy.filter(pl.col("timestamp") <= end_time)
 
-        # 全件を一度にプロセスメモリへ展開せず、ストリーミングでcombined.parquetへ直接書き出す
-        # (data_pathの合計が数十GBあってもここでメモリを使い切らないようにするため)
-        combined_path = output_path / "combined.parquet"
-        combined_lazy.sink_parquet(combined_path, row_group_size=COMBINED_PARQUET_ROW_GROUP_SIZE)
+        # combined.parquetの出力は必須ではない(大量データ選択時は書き出し自体が時間を食うため、
+        # 不要ならスキップできる)。スキップする場合は、元のlazyパイプラインをそのまま解析に使う
+        # (ファイルには一度も書き出さない分、全件を一度にプロセスメモリへ展開せず済むメリットは失う
+        #  ので、多数の小さいファイルを都度読み直す分だけ解析側がわずかに遅くなる)。
+        if generate_combined_parquet:
+            combined_path = output_path / "combined.parquet"
+            # ストリーミングで直接書き出す(data_pathの合計が数十GBあってもここでメモリを使い切らないため)
+            combined_lazy.sink_parquet(
+                combined_path,
+                row_group_size=COMBINED_PARQUET_ROW_GROUP_SIZE,
+                compression=COMBINED_PARQUET_COMPRESSION,
+            )
+            analysis_source: Path | pl.LazyFrame = combined_path
+            logger.info("combined.parquet を出力しました")
+        else:
+            analysis_source = combined_lazy
+            logger.info("combined.parquetの出力はスキップしました")
         progress.update(task, completed=1, total=1)
 
-        # 行数はメタデータから取得するだけなので、ここでも全件はメモリに載らない
-        n_rows = pl.scan_parquet(combined_path).select(pl.len()).collect().item()
+        def _scan(source: Path | pl.LazyFrame) -> pl.LazyFrame:
+            return pl.scan_parquet(source) if isinstance(source, Path) else source
+
+        # 行数の取得は、combined.parquetがあればメタデータだけで済むため全件はメモリに載らない
+        # (スキップした場合は元ファイル群を軽量にスキャンして数える)
+        n_rows = _scan(analysis_source).select(pl.len()).collect().item()
         if n_rows == 0:
-            combined_path.unlink(missing_ok=True)
+            if generate_combined_parquet:
+                combined_path.unlink(missing_ok=True)
             msg = "指定された範囲にレコードがありません"
             raise ValueError(msg)
         logger.info(f"{n_rows} 件のレコードを読み込みました")
-        logger.info("combined.parquet を出力しました")
 
         # 1回目: 軽量な列(timestamp/water_content/peak_distance)だけを全件読み込む。
         # 1行あたりのサイズが小さいため、行数がどれだけ多くてもこの読み込みでメモリを使い切ることはない。
-        # water_contentがcompute_water_content側で100%にクリップされた異常値(ピーク誤検出等)は、
-        # グラフ用データから除外する(combined.parquetには影響しない、生データのまま出力済み)。
+        # peak_distanceがしきい値を超える異常値(ピーク誤検出等)は、グラフ用データから除外する
+        # (combined.parquetには影響しない、生データのまま出力済み)。
         task = progress.add_task("水分量トレンドを読み込み中", total=None)
+        peak_distance_clip_threshold = peak_distance_clip_threshold_ns * 1e-9
         light_df = (
-            pl.scan_parquet(combined_path)
+            _scan(analysis_source)
             .with_row_index("__row__")
-            .filter(pl.col("water_content") < water_content_clip_threshold)
+            .filter(pl.col("peak_distance") <= peak_distance_clip_threshold)
             .select(["__row__", "timestamp", "water_content", "peak_distance"])
             .collect()
         )
         n_clipped = n_rows - light_df.height
         if n_clipped:
             logger.info(
-                f"water_contentが{water_content_clip_threshold}%以上のレコードを"
+                f"peak_distanceが{peak_distance_clip_threshold_ns}ns超のレコードを"
                 f"{n_clipped}件、グラフ用データから除外しました",
             )
         n_plot_rows = light_df.height
 
         trend_df = light_df.select(["timestamp", "water_content", "peak_distance"])
-        trend_plot_df = trend_df[_evenly_spaced_indices(n_plot_rows, max_trend_points)]
+        # グラフ用はtz無しのJST時刻にする(matplotlibは既定でUTC表示、plotly.jsはオフセットを無視するため)
+        trend_plot_df = trend_df[_evenly_spaced_indices(n_plot_rows, max_trend_points)].with_columns(
+            pl.col("timestamp").dt.replace_time_zone(None),
+        )
         logger.info(f"グラフ用に水分量トレンドを {trend_plot_df.height} 件に間引きました")
         progress.update(task, completed=1, total=1)
 
@@ -150,19 +191,24 @@ def postprocess(
         # 間引き後に実際に使う行(既定で最大800行)だけをピンポイントで読み込む。
         # combined_df/plot_dfのように全行×重い列をまとめてメモリに載せることは行わない。
         # コマの選び方は均等間隔ではなく、water_contentが実際に変化した場面を優先する。
-        task = progress.add_task("インパルス応答の波形を読み込み中", total=None)
-        frame_indices = _water_content_change_indices(light_df, max_impulse_frames)
-        target_rows = light_df["__row__"][frame_indices].to_list()
-        impulse_df = (
-            pl.scan_parquet(combined_path)
-            .with_row_index("__row__")
-            .filter(pl.col("__row__").is_in(target_rows))
-            .sort("__row__")  # フィルタ後も時系列順を保つ(並列実行時の順序ゆらぎ対策)
-            .select(["timestamp", "t_axis", "impulse_response", "peak_positions"])
-            .collect()
-        )
-        progress.update(task, completed=1, total=1)
-        logger.info(f"波形グラフ用に {impulse_df.height} 件のレコードを間引いて読み込みました")
+        # (データが重いときに時間がかかりやすい出力なので、不要ならスキップできる)
+        impulse_df = None
+        if generate_impulse_response:
+            task = progress.add_task("インパルス応答の波形を読み込み中", total=None)
+            frame_indices = _water_content_change_indices(light_df, max_impulse_frames)
+            target_rows = light_df["__row__"][frame_indices].to_list()
+            impulse_df = (
+                _scan(analysis_source)
+                .with_row_index("__row__")
+                .filter(pl.col("__row__").is_in(target_rows))
+                .sort("__row__")  # フィルタ後も時系列順を保つ(並列実行時の順序ゆらぎ対策)
+                .select(["timestamp", "t_axis", "impulse_response", "peak_positions"])
+                .collect()
+            )
+            progress.update(task, completed=1, total=1)
+            logger.info(f"波形グラフ用に {impulse_df.height} 件のレコードを間引いて読み込みました")
+        else:
+            logger.info("impulse_responseの生成はスキップしました")
 
     _write_water_content_csv(trend_df, output_path / "water_content_trend.csv")
     logger.info("water_content_trend.csv を出力しました")
@@ -173,8 +219,9 @@ def postprocess(
     _write_water_content_html(trend_plot_df, output_path / "water_content_trend.html")
     logger.info("water_content_trend.html を出力しました")
 
-    _write_impulse_response_html(impulse_df, output_path / "impulse_response.html")
-    logger.info("impulse_response.html を出力しました")
+    if impulse_df is not None:
+        _write_impulse_response_html(impulse_df, output_path / "impulse_response.html")
+        logger.info("impulse_response.html を出力しました")
 
 
 def _zoom_rescale_script(div_id: str, targets: list[dict]) -> str:
@@ -274,7 +321,7 @@ def _write_water_content_csv(trend_df: pl.DataFrame, path: Path) -> None:
 def _write_water_content_png(trend_df: pl.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(trend_df["timestamp"], trend_df["water_content"], color=WATER_CONTENT_COLOR, linewidth=2)
-    ax.set_xlabel("Time")
+    ax.set_xlabel("Time (JST)")
     ax.set_ylabel("Water Content (%)")
     ax.grid(visible=True, alpha=0.3)
     # 測定期間が長いとティックラベルが重なるため、間隔を自動調整して見やすくする
@@ -304,7 +351,7 @@ def _write_water_content_html(trend_df: pl.DataFrame, path: Path) -> None:
     )
     fig.update_layout(
         template="plotly_white",
-        xaxis={"title": "Time", **_TIME_RANGE_AXIS_OPTIONS},
+        xaxis={"title": "Time (JST)", **_TIME_RANGE_AXIS_OPTIONS},
         yaxis_title="Water Content (%)",
         hovermode="x unified",
     )
@@ -378,11 +425,7 @@ def _write_impulse_response_html(impulse_df: pl.DataFrame, path: Path) -> None:
                 [frame.name],
                 {"mode": "immediate", "frame": {"duration": 0, "redraw": False}, "transition": {"duration": 0}},
             ],
-            "label": (
-                timestamp.strftime("%m/%d %H:%M:%S")
-                if i % label_stride == 0 or i == len(frames) - 1
-                else ""
-            ),
+            "label": (timestamp.strftime("%m/%d %H:%M:%S") if i % label_stride == 0 or i == len(frames) - 1 else ""),
         }
         for i, (frame, timestamp) in enumerate(zip(frames, timestamps, strict=True))
     ]
@@ -397,7 +440,7 @@ def _write_impulse_response_html(impulse_df: pl.DataFrame, path: Path) -> None:
             sliders=[
                 {
                     "active": 0,
-                    "currentvalue": {"prefix": "Time: "},
+                    "currentvalue": {"prefix": "Time (JST): "},
                     "pad": {"t": 50},
                     "steps": steps,
                     "transition": {"duration": 0},
@@ -431,23 +474,35 @@ if __name__ == "__main__":
         help="水分量トレンドグラフ(PNG/HTML)に使う間引き後の点数(既定値: 20000)",
     )
     parser.add_argument(
-        "--water-content-clip-threshold",
+        "--peak-distance-clip-threshold-ns",
         type=float,
-        default=WATER_CONTENT_CLIP_THRESHOLD,
+        default=PEAK_DISTANCE_CLIP_THRESHOLD_NS,
         help=(
-            "water_contentがこの値以上(compute_water_content側でクリップされた異常値)の"
-            f"レコードをグラフから除外する(既定値: {WATER_CONTENT_CLIP_THRESHOLD})"
+            "peak_distance(ns)がこの値を超える(ピーク誤検出等による異常値)"
+            f"レコードをグラフから除外する(既定値: {PEAK_DISTANCE_CLIP_THRESHOLD_NS})"
         ),
     )
     parser.add_argument("--start-time", help="この時刻(ISO8601)以降のレコードのみ処理する")
     parser.add_argument("--end-time", help="この時刻(ISO8601)以前のレコードのみ処理する")
+    parser.add_argument(
+        "--skip-combined-parquet",
+        action="store_true",
+        help="combined.parquetの出力をスキップする(データ量が多いとき、書き出し時間を短縮できる)",
+    )
+    parser.add_argument(
+        "--skip-impulse-response",
+        action="store_true",
+        help="impulse_response.htmlの出力をスキップする(処理時間を短縮できる)",
+    )
     args = parser.parse_args()
     postprocess(
         args.data_path,
         args.output_path,
         args.max_impulse_frames,
         args.max_trend_points,
-        args.water_content_clip_threshold,
+        args.peak_distance_clip_threshold_ns,
         args.start_time,
         args.end_time,
+        generate_combined_parquet=not args.skip_combined_parquet,
+        generate_impulse_response=not args.skip_impulse_response,
     )

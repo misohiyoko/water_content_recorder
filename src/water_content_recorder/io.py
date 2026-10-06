@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +26,9 @@ DEFAULT_DECIMATE = 10
 HISTORY_WINDOW = timedelta(hours=1)
 HISTORY_MAX_POINTS = 300
 PREVIEW_MAX_POINTS = 2000
+# 概形プレビューで、直前のレコードからこの秒数より間隔が空いていたら測定が行われていない
+# 空白期間とみなし、グラフ上では線をつなげず途切れさせる(通常の測定間隔より十分大きい値)
+PREVIEW_GAP_THRESHOLD_SECONDS = 60
 DEFAULT_STATIC_DIR = Path(__file__).resolve().parents[2] / "frontend" / "build"
 
 
@@ -158,6 +161,13 @@ class SignalRecorder:
         )
 
 
+def _ms_to_datetime(ms: str | float | None) -> datetime | None:
+    """フロントエンドから受け取ったUNIX時刻(ms)をtz付きdatetimeに変換する。未指定(None/空文字)ならNone。"""
+    if ms is None or ms == "":
+        return None
+    return datetime.fromtimestamp(float(ms) / 1000, tz=UTC)
+
+
 def serve_latest_http(
     recorder: SignalRecorder,
     host: str = DEFAULT_HTTP_HOST,
@@ -236,14 +246,46 @@ def serve_latest_http(
                 return
             from postprocess import _evenly_spaced_indices  # noqa: PLC0415 (重いためこの時だけ読み込む)
 
-            df = pl.scan_parquet(parquet_files).select(["timestamp", "water_content"]).sort("timestamp").collect()
-            df = df[_evenly_spaced_indices(df.height, PREVIEW_MAX_POINTS)]
-            self._send_json(
-                {
-                    "timestamps": [t.isoformat() for t in df["timestamp"].to_list()],
-                    "water_content": df["water_content"].to_list(),
-                },
-            )
+            lazy = pl.scan_parquet(parquet_files).select(["timestamp", "water_content"])
+            # 範囲はUNIX時刻(ms)で受け取る。範囲内だけで間引くので、狭い範囲でも点が粗くならない
+            try:
+                start, end = (_ms_to_datetime(query.get(k, [""])[0]) for k in ("start_ms", "end_ms"))
+            except ValueError:
+                self._send_json({"error": "start_ms/end_msが不正です"}, status=400)
+                return
+            if start is not None:
+                lazy = lazy.filter(pl.col("timestamp") >= start)
+            if end is not None:
+                lazy = lazy.filter(pl.col("timestamp") <= end)
+            df = lazy.sort("timestamp").collect()
+            n = df.height
+            if n == 0:
+                self._send_json({"times_ms": [], "water_content": []})
+                return
+
+            # 直前の行との間隔がしきい値を超える行(=測定が行われていない空白期間の直後の最初の行)を検出する
+            gap_seconds = df["timestamp"].diff().dt.total_seconds().fill_null(0.0)
+            gap_starts = {i for i in range(1, n) if gap_seconds[i] > PREVIEW_GAP_THRESHOLD_SECONDS}
+
+            # 間引き後の点に加え、空白期間の前後の点は必ず残す(間引きで消えると空白の境界がぼやけるため)
+            indices = set(_evenly_spaced_indices(n, PREVIEW_MAX_POINTS))
+            for i in gap_starts:
+                indices.update((i - 1, i))
+
+            times_ms = df["timestamp"].dt.epoch("ms")
+            timestamps: list[int] = []
+            water_content: list[float | None] = []
+            prev_idx = None
+            for idx in sorted(indices):
+                if prev_idx is not None and idx in gap_starts and idx - 1 == prev_idx:
+                    # 採用した2点の間に空白期間があるため、null点を挟んでグラフ上で線をつなげないようにする
+                    timestamps.append(times_ms[idx])
+                    water_content.append(None)
+                timestamps.append(times_ms[idx])
+                water_content.append(df["water_content"][idx])
+                prev_idx = idx
+
+            self._send_json({"times_ms": timestamps, "water_content": water_content})
 
         def _handle_postprocess(self) -> None:
             length = int(self.headers.get("Content-Length", 0))
@@ -252,8 +294,10 @@ def serve_latest_http(
                 dirs = body["dirs"]
                 if not isinstance(dirs, list) or not dirs or not all(isinstance(d, str) for d in dirs):
                     raise ValueError  # noqa: TRY301
+                start_time = _ms_to_datetime(body.get("start_ms"))
+                end_time = _ms_to_datetime(body.get("end_ms"))
             except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                self._send_json({"error": "dirsが不正です"}, status=400)
+                self._send_json({"error": "dirs/start_ms/end_msが不正です"}, status=400)
                 return
             paths = [recorder.output_dir / d for d in dirs]
             output_dir = recorder.output_dir / f"{'_'.join(dirs)}_output"
@@ -263,8 +307,10 @@ def serve_latest_http(
                 postprocess(
                     paths,
                     output_dir,
-                    start_time=body.get("start_time") or None,
-                    end_time=body.get("end_time") or None,
+                    start_time=start_time,
+                    end_time=end_time,
+                    generate_combined_parquet=body.get("generate_combined_parquet", True),
+                    generate_impulse_response=body.get("generate_impulse_response", True),
                 )
             except Exception:  # postprocess由来の様々な例外をJSONエラーとして返す
                 logger.exception("postprocessに失敗しました")
